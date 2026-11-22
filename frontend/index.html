@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI Doctor</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🩺</text></svg>">
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-head">
+        <button class="new-chat" id="new-chat">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+          New chat
+        </button>
+      </div>
+      <nav class="chat-list" id="chat-list"></nav>
+      <div class="sidebar-foot">
+        <button class="ghost" id="open-documents">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h10l6 6v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z"/><path d="M14 4v6h6"/></svg>
+          Documents
+          <span class="badge" id="doc-badge"></span>
+        </button>
+        <button class="ghost" id="open-settings-side">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          Settings
+        </button>
+        <button class="status-line model-line" id="model-line" title="Change model"></button>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <button class="icon-button" id="toggle-sidebar" aria-label="Toggle sidebar">
+          <svg viewBox="0 0 24 24"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+        </button>
+        <h1 id="chat-title">AI Doctor</h1>
+        <button class="model-chip" id="model-chip" title="Change model" hidden></button>
+        <button class="icon-button" id="open-settings" aria-label="Settings" title="Settings">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        </button>
+      </header>
+
+      <div class="messages" id="messages">
+        <div class="empty" id="empty-state">
+          <div class="empty-icon">🩺</div>
+          <h2>Ask about your documents</h2>
+          <p>Every answer cites the document and page it came from.</p>
+          <div class="suggestions" id="suggestions"></div>
+        </div>
+      </div>
+
+      <div class="composer-wrap">
+        <form class="composer" id="composer">
+          <textarea id="input" rows="1" placeholder="Ask a question…" autocomplete="off"></textarea>
+          <button type="submit" id="send" aria-label="Send">
+            <svg viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+          </button>
+        </form>
+        <p class="disclaimer">Answers come only from the indexed documents.</p>
+      </div>
+    </main>
+  </div>
+
+  <div class="overlay" id="documents-panel" hidden>
+    <div class="panel">
+      <header class="panel-head">
+        <h2>Documents</h2>
+        <button class="icon-button" id="close-documents" aria-label="Close">
+          <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+      </header>
+
+      <div class="panel-body">
+        <label class="dropzone" id="dropzone">
+          <input type="file" id="file-input" multiple accept=".pdf,.txt,.md" hidden>
+          <strong>Add documents</strong>
+          <span>PDF, TXT or MD — drag here or click to browse</span>
+        </label>
+
+        <div class="panel-actions">
+          <button class="primary" id="index-button">Index new documents</button>
+          <button class="ghost" id="rebuild-button">Rebuild everything</button>
+        </div>
+
+        <div class="doc-list" id="doc-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="overlay" id="settings-panel" hidden>
+    <div class="panel settings">
+      <header class="panel-head">
+        <h2>Settings</h2>
+        <button class="icon-button" id="close-settings" aria-label="Close">
+          <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+      </header>
+
+      <div class="panel-body">
+        <section class="field-group">
+          <h3>Model that writes the answers</h3>
+          <div class="segmented" id="provider-tabs" role="tablist">
+            <button type="button" role="tab" data-provider="openai">OpenAI</button>
+            <button type="button" role="tab" data-provider="nvidia">NVIDIA</button>
+            <button type="button" role="tab" data-provider="ollama">Ollama</button>
+          </div>
+          <p class="hint" id="provider-active-note"></p>
+        </section>
+
+        <!-- OpenAI -->
+        <section class="provider-pane" data-pane="openai">
+          <label class="field">
+            <span class="field-label">API key <span class="source-tag" data-source-for="openai"></span></span>
+            <div class="secret">
+              <input type="password" id="openai-key" autocomplete="off" spellcheck="false" placeholder="sk-…">
+              <button type="button" class="reveal" data-reveal="openai-key" aria-label="Show key">Show</button>
+            </div>
+            <span class="hint">Also used for search (text-embedding-3-large), whichever provider writes the answers.</span>
+          </label>
+          <div class="field">
+            <span class="field-label">Model</span>
+            <div class="model-row">
+              <select id="openai-model"></select>
+              <button type="button" class="ghost-btn" data-load="openai">Refresh list</button>
+            </div>
+            <input type="text" class="custom-model" id="openai-model-custom" placeholder="Model name, e.g. gpt-4o" hidden>
+          </div>
+          <details class="advanced">
+            <summary>Advanced</summary>
+            <label class="field">
+              <span class="field-label">Base URL</span>
+              <input type="text" id="openai-base" placeholder="https://api.openai.com/v1">
+            </label>
+          </details>
+        </section>
+
+        <!-- NVIDIA -->
+        <section class="provider-pane" data-pane="nvidia" hidden>
+          <label class="field">
+            <span class="field-label">API key <span class="source-tag" data-source-for="nvidia"></span></span>
+            <div class="secret">
+              <input type="password" id="nvidia-key" autocomplete="off" spellcheck="false" placeholder="nvapi-…">
+              <button type="button" class="reveal" data-reveal="nvidia-key" aria-label="Show key">Show</button>
+            </div>
+            <span class="hint">Create one at build.nvidia.com. Search still uses your OpenAI key.</span>
+          </label>
+          <div class="field">
+            <span class="field-label">Model</span>
+            <div class="model-row">
+              <select id="nvidia-model"></select>
+              <button type="button" class="ghost-btn" data-load="nvidia">Refresh list</button>
+            </div>
+            <input type="text" class="custom-model" id="nvidia-model-custom" placeholder="Model name, e.g. meta/llama-3.3-70b-instruct" hidden>
+          </div>
+          <details class="advanced">
+            <summary>Advanced</summary>
+            <label class="field">
+              <span class="field-label">Base URL</span>
+              <input type="text" id="nvidia-base" placeholder="https://integrate.api.nvidia.com/v1">
+            </label>
+          </details>
+        </section>
+
+        <!-- Ollama -->
+        <section class="provider-pane" data-pane="ollama" hidden>
+          <label class="field">
+            <span class="field-label">Ollama host</span>
+            <input type="text" id="ollama-host" placeholder="http://host.docker.internal:11434">
+            <span class="hint">Runs on your machine, no key needed. Search still uses your OpenAI key.</span>
+          </label>
+          <div class="field">
+            <span class="field-label">Model</span>
+            <div class="model-row">
+              <select id="ollama-model"></select>
+              <button type="button" class="ghost-btn" data-load="ollama">Refresh list</button>
+            </div>
+            <input type="text" class="custom-model" id="ollama-model-custom" placeholder="Model name, e.g. medgemma:4b" hidden>
+          </div>
+        </section>
+
+        <p class="settings-message" id="settings-message" role="status"></p>
+      </div>
+
+      <footer class="panel-foot">
+        <button type="button" class="ghost-btn" id="test-provider">Test connection</button>
+        <span class="spacer"></span>
+        <button type="button" class="ghost-btn" id="cancel-settings">Cancel</button>
+        <button type="button" class="primary" id="save-settings">Save</button>
+      </footer>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

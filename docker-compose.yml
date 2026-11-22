@@ -1,0 +1,93 @@
+name: ai-doctor
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-aidoctor}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-aidoctor}
+      POSTGRES_DB: ${POSTGRES_DB:-aidoctor}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      # Only for connecting a database client from your machine; the backend
+      # reaches Postgres over the compose network regardless. Off the default
+      # port so it does not clash with a Postgres already installed locally.
+      - "${POSTGRES_PORT:-5433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aidoctor} -d ${POSTGRES_DB:-aidoctor}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-aidoctor}:${POSTGRES_PASSWORD:-aidoctor}@db:5432/${POSTGRES_DB:-aidoctor}
+      LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      OPENAI_CHAT_MODEL: ${OPENAI_CHAT_MODEL:-gpt-4o-mini}
+      OLLAMA_CHAT_MODEL: ${OLLAMA_CHAT_MODEL:-medgemma:4b}
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
+      NVIDIA_BASE_URL: ${NVIDIA_BASE_URL:-}
+      NVIDIA_CHAT_MODEL: ${NVIDIA_CHAT_MODEL:-meta/llama-3.3-70b-instruct}
+      # localhost inside a container is the container itself. This name is how
+      # Docker Desktop exposes the host, where Ollama is running.
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
+      OLLAMA_NUM_CTX: ${OLLAMA_NUM_CTX:-16384}
+      EMBED_DIM: ${EMBED_DIM:-1536}
+      PDF_EXTRACTION: ${PDF_EXTRACTION:-fast}
+      CHILD_TOKENS: ${CHILD_TOKENS:-400}
+      PARENT_TOKENS: ${PARENT_TOKENS:-1600}
+      QUERY_VARIANTS: ${QUERY_VARIANTS:-4}
+      CANDIDATES: ${CANDIDATES:-30}
+      PASSAGES: ${PASSAGES:-8}
+      MAX_SPECIALISTS: ${MAX_SPECIALISTS:-4}
+      SHORTLIST: ${SHORTLIST:-24}
+      EVIDENCE_LIMIT: ${EVIDENCE_LIMIT:-16}
+      USE_HYPOTHESIS: ${USE_HYPOTHESIS:-true}
+      ENABLE_REVIEW: ${ENABLE_REVIEW:-true}
+      ENABLE_SUGGESTIONS: ${ENABLE_SUGGESTIONS:-true}
+    volumes:
+      # Bind-mounted rather than a named volume so the folder stays visible on
+      # your machine: drop a PDF in and the app sees it, uploads land here too.
+      - ./knowledgebase:/data/documents
+    # Makes host.docker.internal resolve on Linux too, so the same file works
+    # on a server later. Ignored by Docker Desktop, which provides it already.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${BACKEND_PORT:-9000}:8000"
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    depends_on:
+      - backend
+    ports:
+      - "${FRONTEND_PORT:-8080}:80"
+    restart: unless-stopped
+
+  # Optional: run Ollama in a container instead of on the host.
+  #   docker compose --profile local-llm up
+  # Then set OLLAMA_HOST=http://ollama:11434 in .env.
+  # GPU acceleration needs WSL2 plus the NVIDIA container toolkit; without it
+  # this runs on CPU, which is slow for anything above a few billion parameters.
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["local-llm"]
+    volumes:
+      - ollama:/root/.ollama
+    ports:
+      - "11434:11434"
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  ollama:
