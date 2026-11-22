@@ -76,40 +76,58 @@ embedding NIM runs separately. A key is only required for NVIDIA's hosted API.
 
 ## How it works
 
-Every question is worked by a panel of roles, the way a senior team would:
+Every question goes through one evidence-first loop. The model reads the
+sources themselves at every step, never another step's paraphrase of them:
 
 ```
-triage        reads the question, classifies it (lookup / concept / management /
-              comparison / vignette) and briefs 1-4 specialists
-diagnostician for case vignettes only: extracts the findings, ranks a
-              differential, names the leading diagnosis — which then becomes
-              what the library is searched for
-specialists   investigate in parallel. Each plans its own search (a hypothetical
-              textbook paragraph to embed, rephrasings with abbreviations
-              expanded, index-style terms), runs hybrid retrieval, and reports
-              findings with numbered citations
-registrar     drafts one coherent answer from the findings
-consultant    reviews the draft against the cited passages themselves, and can
-              send the panel back for what is missing
-attending     writes the final answer in a teaching voice, quoting doses from
-              the passages directly, and closes with cited Pearls
+plan     one call: rewrites the question to stand alone (resolving "what about
+         in pregnancy?" from the conversation), classifies it, splits it into
+         sub-questions, and writes a textbook-style paragraph to search with.
+         For a clinical case or an exam MCQ it also reasons out a differential
+         first, since a case never names its diagnosis.
+search   no model calls: every query is embedded in one request, and vector
+         search plus keyword search run for each angle, fused by rank
+grade    one call scores all ~30 candidates 0-3, drops index pages and tables
+         of contents, and names any sub-question still uncovered. Only then
+         does one targeted second search run.
+pack     the strongest passages are widened with their neighbours (restoring
+         the sentence that qualifies a dose), passages that touch are merged
+         so overlapping text is sent once, and the total is capped at
+         EVIDENCE_TOKENS
+write    one call writes from the sources, citing [n] for every claim
+verify   a free automatic check that every figure in a cited sentence appears
+         in its source, then one call checking every claim against its source.
+         A correction is written only when something is wrong.
 ```
+
+Answers are shaped by question type: **quick lookup**, **concept** (a chain of
+causes), **management** (first-line with exact doses, alternatives,
+monitoring), **comparison** (a table), **clinical case** (findings,
+differential, leading diagnosis, confirmation, management), and **exam MCQ**
+(the answer letter, why it is right, why each other option is wrong, and the
+concept being tested). Greetings and thanks get a short reply with no search.
+
+Each answer shows its research trace: the sub-questions and whether your
+documents covered each, an evidence-strength rating, what was searched for
+again, and what the fact-check corrected.
+
+**Tokens.** A typical question takes 4-6 model calls and about 20k input
+tokens. The evidence is sent as one identical block to the writer, the checker
+and the corrector, so Claude (with an explicit cache breakpoint) and OpenAI
+(through automatic prefix caching) charge full price for it only once. Under
+**Settings → Models → Helper model** you can choose a cheaper model for
+planning, grading and checking, while the main model writes. Repeated questions
+reuse their embeddings, and token use per call is written to the backend log.
 
 Retrieval is hybrid: vector search finds wording the question did not use;
-full-text search finds the exact strings vector search blurs, like doses and
-codes. Short index terms are searched individually — Postgres ANDs every word
-it is given, so whole sentences over-constrain the match. Everything is
-combined by rank (reciprocal rank fusion), which avoids reconciling different
-score scales.
+keyword search finds exact strings like doses and codes. Whole questions are
+matched on any of their words, ranked by how many appear close together;
+short index terms must match every word. Results are combined by reciprocal
+rank fusion, so different score scales never have to be reconciled.
 
-The answer's citation markers are checked against the sources before the reply
-is stored: a marker that points at nothing is removed. After each answer, three
-follow-up questions are offered as one-click chips.
-
-Passages are built by packing paragraphs and never span a page boundary, so page
-numbers in citations are exact. Each passage is stored with the wider section
-around it, and that wider text is what the model reads — a figure is never
-separated from the sentence that qualifies it.
+Passages never span a page boundary, so the page numbers in citations are
+exact. A citation marker that points at nothing is removed before the answer
+is stored.
 
 ## Ports
 
@@ -139,11 +157,11 @@ prefer them (see `.env.example`):
 | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `NVIDIA_API_KEY` | none | or add them in Settings |
 | `EMBED_PROVIDER` / `EMBED_MODEL` | `openai` / `text-embedding-3-large` | the model the index is built with |
 | `PDF_EXTRACTION` | `fast` | `fast` or `thorough` |
-| `PASSAGES` | `8` | passages each specialist reads per question |
-| `QUERY_VARIANTS` | `4` | rephrasings searched per specialist |
-| `MAX_SPECIALISTS` | `4` | most specialists triage may assign |
-| `EVIDENCE_LIMIT` | `16` | cited passages shown verbatim to reviewer and writer |
-| `ENABLE_REVIEW` | `true` | consultant's review pass on multi-specialist answers |
+| `SHORTLIST` | `30` | candidates retrieved for grading |
+| `PASSAGES` | `12` | most passages kept after grading |
+| `EVIDENCE_TOKENS` | `7000` | ceiling on the evidence sent to the writer |
+| `QUERY_VARIANTS` | `4` | rephrasings searched per question |
+| `ENABLE_REVIEW` | `true` | the second search for gaps, and the fact-check |
 | `ENABLE_SUGGESTIONS` | `true` | three follow-up questions after each answer |
 
 **API keys are stored in plain text** in the local Postgres database. The API
@@ -158,8 +176,9 @@ still adjusting things.
 
 Indexing roughly 9,400 pages (~6M tokens) with `text-embedding-3-large` costs
 well under a dollar, one time. Local embeddings through Ollama cost nothing. The recurring cost is answering: each question
-sends about 10k tokens of passages to the chat model. Lower `PASSAGES` to spend
-less per question.
+sends up to `EVIDENCE_TOKENS` (7k) of evidence, cached across the writer and
+checker. Pick a cheaper helper model in Settings, or lower `EVIDENCE_TOKENS`,
+to spend less per question.
 
 ## Data
 
@@ -190,8 +209,8 @@ backend/
   app/providers.py       OpenAI, Claude, NVIDIA NIM, Ollama: chat and embeddings
   app/ingest.py          PDF → passages → Postgres
   app/retrieve.py        vector + full-text search, rank fusion
-  app/team.py            the panel: prompts and roles, triage → review → answer
-  app/pipeline.py        runs the consultation, streams events
+  app/team.py            the tutor: prompts, plan, grade, evidence packing, fact-check
+  app/pipeline.py        runs plan → search → grade → write → verify, streams events
   app/store.py           chats and messages
   app/main.py            HTTP API
 frontend/

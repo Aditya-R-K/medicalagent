@@ -77,6 +77,10 @@ class ConfigUpdate(BaseModel):
     ollama_chat_model: str | None = Field(None, max_length=200)
     embed_provider: str | None = Field(None, max_length=40)
     embed_model: str | None = Field(None, max_length=200)
+    openai_fast_model: str | None = Field(None, max_length=200)
+    anthropic_fast_model: str | None = Field(None, max_length=200)
+    nvidia_fast_model: str | None = Field(None, max_length=200)
+    ollama_fast_model: str | None = Field(None, max_length=200)
 
 
 class ModelQuery(BaseModel):
@@ -172,20 +176,24 @@ def read_config() -> dict:
                 **_key_info("openai_api_key", saved),
                 "base_url": settings.openai_base_url,
                 "model": settings.openai_chat_model,
+                "fast_model": settings.fast_models.get("openai", ""),
             },
             "anthropic": {
                 **_key_info("anthropic_api_key", saved),
                 "model": settings.anthropic_chat_model,
+                "fast_model": settings.fast_models.get("anthropic", ""),
             },
             "nvidia": {
                 **_key_info("nvidia_api_key", saved),
                 "base_url": settings.nvidia_base_url,
                 "embed_base_url": settings.nvidia_embed_base_url,
                 "model": settings.nvidia_chat_model,
+                "fast_model": settings.fast_models.get("nvidia", ""),
             },
             "ollama": {
                 "host": settings.ollama_host,
                 "model": settings.ollama_chat_model,
+                "fast_model": settings.fast_models.get("ollama", ""),
             },
         },
         "embedding": {

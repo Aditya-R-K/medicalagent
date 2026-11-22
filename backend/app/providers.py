@@ -13,6 +13,7 @@ import json
 import logging
 import re
 import time
+from collections import OrderedDict
 from typing import Iterator, Sequence
 
 log = logging.getLogger(__name__)
@@ -35,6 +36,9 @@ CLAUDE_FALLBACK_MODELS = {
     "claude-sonnet-5-5",
 }
 CLAUDE_FALLBACK_BETA = "server-side-fallback-2026-07-01"
+# Claude models that take output_config.effort. Helper calls ask for low effort.
+CLAUDE_EFFORT_MODELS = re.compile(
+    r"claude-(fable|mythos|opus-5|sonnet-5|haiku-5|opus-4-[5-9]|sonnet-4-6)")
 
 try:
     import tiktoken
@@ -173,12 +177,25 @@ def _embed_client(settings):
 
 
 class ChatModel:
-    def __init__(self, settings) -> None:
+    """One chat model behind one interface, whatever the provider.
+
+    `fast=True` selects the helper model (planning, ranking, checking) when one
+    is configured, and the answer model otherwise.
+
+    `context` is a large block shared by several calls in one question - the
+    evidence. It is sent first, ahead of the role's instructions, so the calls
+    share an identical prefix: Claude caches it explicitly (cache_control) and
+    OpenAI-protocol providers cache matching prefixes automatically. The writer,
+    the checker and the corrector then pay full price for the evidence once.
+    """
+
+    def __init__(self, settings, fast: bool = False) -> None:
         if settings.llm_provider not in CHAT_PROVIDERS:
             raise ProviderError(f"unknown chat provider '{settings.llm_provider}'")
         self.settings = settings
         self.provider = settings.llm_provider
-        self.model = settings.chat_model
+        self.model = (settings.fast_model if fast and settings.fast_model
+                      else settings.chat_model)
         self.name = f"{self.provider}:{self.model}"
         self._client = _chat_client(settings)
         # OpenAI-protocol providers (OpenAI and NVIDIA). Some of their models
@@ -187,11 +204,18 @@ class ChatModel:
         self._compatible = self.provider in ("openai", "nvidia")
         self._send_temperature = True
         self._send_json_mode = self.provider == "openai"
+        self._send_effort = self.provider == "anthropic" and bool(
+            CLAUDE_EFFORT_MODELS.match(self.model))
 
     # ---------------------------------------------------------- message shapes
 
-    def _messages(self, system: str, user: str, history: list[dict] | None) -> list[dict]:
-        messages = [{"role": "system", "content": system}]
+    @staticmethod
+    def _system_text(system: str, context: str | None) -> str:
+        return f"{context}\n\n{system}" if context else system
+
+    def _messages(self, system: str, user: str, history: list[dict] | None,
+                  context: str | None = None) -> list[dict]:
+        messages = [{"role": "system", "content": self._system_text(system, context)}]
         messages.extend(history or [])
         messages.append({"role": "user", "content": user})
         return messages
@@ -211,13 +235,25 @@ class ChatModel:
                 turns.append({"role": turn["role"], "content": turn["content"]})
         return turns
 
-    def _claude_arguments(self, system: str, user: str, history, max_tokens: int) -> dict:
+    def _claude_arguments(self, system: str, user: str, history, max_tokens: int,
+                          context: str | None = None, effort: str | None = None) -> dict:
+        if context:
+            # Evidence first, with a cache breakpoint after it: every call in
+            # this question that sends the same evidence reads it from cache.
+            system_blocks = [
+                {"type": "text", "text": context, "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": system},
+            ]
+        else:
+            system_blocks = system
         arguments = {
             "model": self.model,
             "max_tokens": max_tokens,
-            "system": system,
+            "system": system_blocks,
             "messages": self._claude_messages(user, history),
         }
+        if effort and self._send_effort:
+            arguments["output_config"] = {"effort": effort}
         if self.model in CLAUDE_FALLBACK_MODELS:
             arguments["betas"] = [CLAUDE_FALLBACK_BETA]
             arguments["extra_body"] = {"fallbacks": "default"}
@@ -228,6 +264,18 @@ class ChatModel:
         return self._client.beta.messages if self.model in CLAUDE_FALLBACK_MODELS \
             else self._client.messages
 
+    def _claude_call(self, method: str, arguments: dict):
+        """messages.create / .stream, retried once without effort if refused."""
+        try:
+            return getattr(self._claude_api(), method)(**arguments)
+        except Exception as exc:
+            if "output_config" in arguments and ("effort" in str(exc).lower()
+                                                 or "output_config" in str(exc).lower()):
+                self._send_effort = False
+                arguments.pop("output_config")
+                return getattr(self._claude_api(), method)(**arguments)
+            raise
+
     def _claude_check(self, message) -> None:
         if getattr(message, "stop_reason", None) == "refusal":
             details = getattr(message, "stop_details", None)
@@ -237,6 +285,7 @@ class ChatModel:
                 + (f" ({category})" if category else "")
                 + ". Try rephrasing, or choose another model in Settings."
             )
+        _log_usage(self.name, getattr(message, "usage", None))
 
     def _openai_arguments(self, messages: list[dict], **extra) -> dict:
         arguments = {"model": self.model, "messages": messages, **extra}
@@ -262,28 +311,31 @@ class ChatModel:
 
     def _ollama_options(self) -> dict:
         # Ollama defaults to a small context window and silently drops the
-        # start of anything longer. The specialist prompts carry several
-        # thousand tokens of passages, so the window is set explicitly.
+        # start of anything longer. The evidence alone runs to several
+        # thousand tokens, so the window is set explicitly.
         return {"temperature": 0, "num_ctx": self.settings.ollama_num_ctx}
 
     # ------------------------------------------------------------------ calls
 
     def complete(self, system: str, user: str, history: list[dict] | None = None,
-                 json_only: bool = False) -> str:
+                 json_only: bool = False, context: str | None = None,
+                 effort: str | None = None) -> str:
+        """`effort` ("low" | "medium" | "high") applies to Claude models that
+        support it; helper calls pass "low" to keep thinking short."""
         def call() -> str:
             if self.provider == "anthropic":
-                message = self._claude_api().create(
-                    **self._claude_arguments(system, user, history, 16000)
-                )
+                message = self._claude_call("create", self._claude_arguments(
+                    system, user, history, 16000, context, effort))
                 self._claude_check(message)
                 return "".join(b.text for b in message.content if b.type == "text")
 
-            messages = self._messages(system, user, history)
+            messages = self._messages(system, user, history, context)
             if self._compatible:
                 arguments = self._openai_arguments(messages)
                 if json_only and self._send_json_mode:
                     arguments["response_format"] = {"type": "json_object"}
                 response = self._create(**arguments)
+                _log_usage(self.name, getattr(response, "usage", None))
                 return response.choices[0].message.content or ""
             response = self._client.chat(
                 model=self.model, messages=messages, options=self._ollama_options(),
@@ -293,26 +345,30 @@ class ChatModel:
 
         return _with_retries(call, 4, f"{self.name} request failed").strip()
 
-    def stream(
-        self, system: str, user: str, history: list[dict] | None = None
-    ) -> Iterator[str]:
+    def stream(self, system: str, user: str, history: list[dict] | None = None,
+               context: str | None = None, effort: str | None = None) -> Iterator[str]:
         """Yield the reply in pieces, so the interface can render as it arrives."""
         try:
             if self.provider == "anthropic":
-                with self._claude_api().stream(
-                    **self._claude_arguments(system, user, history, 32000)
-                ) as stream:
+                with self._claude_call("stream", self._claude_arguments(
+                        system, user, history, 32000, context, effort)) as stream:
                     for text in stream.text_stream:
                         yield text
                     self._claude_check(stream.get_final_message())
             elif self._compatible:
-                messages = self._messages(system, user, history)
-                for part in self._create(**self._openai_arguments(messages, stream=True)):
+                messages = self._messages(system, user, history, context)
+                arguments = self._openai_arguments(messages, stream=True)
+                if self.provider == "openai":
+                    arguments["stream_options"] = {"include_usage": True}
+                for part in self._create(**arguments):
+                    if getattr(part, "usage", None):
+                        _log_usage(self.name, part.usage)
                     if part.choices and part.choices[0].delta.content:
                         yield part.choices[0].delta.content
             else:
                 for part in self._client.chat(
-                    model=self.model, messages=self._messages(system, user, history),
+                    model=self.model,
+                    messages=self._messages(system, user, history, context),
                     options=self._ollama_options(), stream=True,
                 ):
                     piece = part.get("message", {}).get("content")
@@ -323,11 +379,12 @@ class ChatModel:
         except Exception as exc:
             raise ProviderError(f"{self.name} stream failed: {exc}") from exc
 
-    def structured(self, system: str, user: str, fallback: dict) -> tuple[dict, bool]:
+    def structured(self, system: str, user: str, fallback: dict,
+                   context: str | None = None) -> tuple[dict, bool]:
         """Ask for JSON, falling back rather than failing when it cannot be parsed."""
         reply = self.complete(
             f"{system}\n\nReply with a single JSON object and nothing else.", user,
-            json_only=True,
+            json_only=True, context=context, effort="low",
         )
         parsed = parse_json(reply)
         if parsed is None:
@@ -336,9 +393,26 @@ class ChatModel:
         return parsed, True
 
 
+def _log_usage(name: str, usage) -> None:
+    """Token use per call, so the cost of a question is visible in the log."""
+    if usage is None:
+        return
+    fields = {
+        "in": getattr(usage, "input_tokens", None) or getattr(usage, "prompt_tokens", None),
+        "out": getattr(usage, "output_tokens", None) or getattr(usage, "completion_tokens", None),
+        "cache_read": getattr(usage, "cache_read_input_tokens", None)
+        or getattr(getattr(usage, "prompt_tokens_details", None), "cached_tokens", None),
+        "cache_write": getattr(usage, "cache_creation_input_tokens", None),
+    }
+    log.info("tokens %s %s", name, " ".join(f"{k}={v}" for k, v in fields.items() if v))
+
+
 # --------------------------------------------------------------------------- #
 # embeddings
 # --------------------------------------------------------------------------- #
+
+
+_QUERY_CACHE: OrderedDict = OrderedDict()
 
 
 class EmbeddingModel:
@@ -374,6 +448,20 @@ class EmbeddingModel:
         return self._encode([truncate(text, self.max_tokens)], kind)[0]
 
     def _encode(self, batch: list[str], kind: str) -> list[list[float]]:
+        # Questions repeat (rephrasings, follow-ups, the same student asking
+        # again); their vectors are kept rather than paid for twice.
+        if kind == "query":
+            keys = [(self.name, self.dim, text) for text in batch]
+            missing = [t for k, t in zip(keys, batch) if k not in _QUERY_CACHE]
+            if missing:
+                for text, vector in zip(missing, self._encode_uncached(missing, kind)):
+                    _QUERY_CACHE[(self.name, self.dim, text)] = vector
+                    if len(_QUERY_CACHE) > 4096:
+                        _QUERY_CACHE.popitem(last=False)
+            return [_QUERY_CACHE[k] for k in keys]
+        return self._encode_uncached(batch, kind)
+
+    def _encode_uncached(self, batch: list[str], kind: str) -> list[list[float]]:
         vectors = _with_retries(
             lambda: raw_embed(self.settings, self._client, batch, kind,
                               self.dim if self.settings.embed_send_dimensions else None),

@@ -1,305 +1,232 @@
-"""A panel of specialists working a question the way a senior team would.
+"""The tutor: plans, gathers evidence, writes, checks.
 
-    triage        reads the question, classifies it, and briefs each specialist
-    diagnostician for case vignettes: findings, differential, leading diagnosis
-    specialists   investigate their own area in parallel, each retrieving separately
-    registrar     drafts an answer from the collected findings
-    consultant    reviews the draft against the cited passages and sends back gaps
-    (second pass runs only for what the consultant asked for)
-    attending     writes the final answer, teaching as a senior doctor would
+    plan      one call: a standalone question, its kind, sub-questions, a
+              textbook-style search probe, rephrasings and index terms, and -
+              for a case or an exam question - a differential before anything
+              is looked up
+    search    hybrid retrieval for every angle at once (no model calls)
+    grade     one call scores every candidate 0-3 and says which sub-questions
+              are still uncovered; one targeted second search runs only then
+    pack      the best passages, widened with their neighbours, merged where
+              they touch, and trimmed to a token budget
+    write     one call writes the answer straight from the sources
+    verify    a free numeric check plus one call against the sources; a
+              correction is written only when something is actually wrong
 
-The point is the review step. A single pass produces whatever the first search
-returned; a panel that criticises its own draft and goes back for what is
-missing produces something closer to a considered answer.
+Every model call sees the sources themselves, never another call's paraphrase
+of them, so nothing drifts between reading and writing. The sources are sent as
+one identical block to the writer, checker and corrector, which providers cache.
 """
 
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import re
 from dataclasses import dataclass, field
 
-from .providers import ChatModel
-from .retrieve import Passage, Retriever, Sources
+from .providers import ChatModel, count_tokens
+from .retrieve import CITATION, Passage, Retriever, Sources
 
 log = logging.getLogger(__name__)
 
-# Roles are framed by what they look for in the documents, not by seniority.
-SPECIALISTS: dict[str, tuple[str, str]] = {
-    "mechanism": (
-        "Pathophysiology",
-        "disease mechanism, immunology, histopathology, pathogenesis, natural history",
-    ),
-    "clinical": (
-        "Clinical assessment",
-        "presentation, morphology, distribution, variants, differential diagnosis, "
-        "diagnostic criteria and investigations",
-    ),
-    "therapeutics": (
-        "Therapeutics",
-        "treatment options, drug selection, dosing and regimens, sequencing, "
-        "expected response and duration",
-    ),
-    "safety": (
-        "Safety and monitoring",
-        "adverse effects, contraindications, drug interactions, monitoring "
-        "requirements, use in pregnancy, children, renal or hepatic impairment",
-    ),
-    "evidence": (
-        "Evidence and guidelines",
-        "trial data, comparative effectiveness, guideline positions, strength and "
-        "limitations of the evidence, areas of disagreement",
-    ),
+MODES = ("lookup", "concept", "management", "comparison", "vignette", "mcq", "chat")
+
+# --------------------------------------------------------------------------- #
+# prompts
+# --------------------------------------------------------------------------- #
+
+PLAN = """\
+You plan how to answer a medical student's question from their own documents \
+(the textbooks, notes and guidelines they uploaded). You do not answer it.
+
+Return JSON:
+{
+  "standalone"  : the question rewritten to stand alone. Resolve "it", "this", \
+"what about..." from the conversation. Keep every detail of a case or exam \
+question, including all answer options, verbatim.
+  "mode"        : lookup | concept | management | comparison | vignette | mcq | chat
+  "subquestions": 1-4 standalone questions whose answers together answer it; \
+exactly 1 for a lookup. For a vignette or mcq: what must be looked up to confirm \
+the leading diagnosis and to decide between the options.
+  "probe"       : the paragraph a textbook would contain in answer. Confident \
+textbook prose, technical vocabulary, at most 4 sentences. A search probe only, \
+never shown to anyone: sounding like the passage matters more than being right.
+  "variants"    : up to {variants} rephrasings in different vocabulary: expand \
+every abbreviation, use synonyms, generic and brand drug names.
+  "terms"       : 4-8 short index-style terms (2-3 words each), abbreviations \
+expanded.
+  "case"        : vignette or mcq only, else omit: {"findings": salient positives \
+and negatives, "differential": [{"diagnosis": "...", "for": "...", "against": \
+"..."}] (3-5, most likely first), "leading": the most likely diagnosis or best \
+option}
 }
-
-TRIAGE = """\
-You are triaging a medical student's question for a specialist panel that \
-answers strictly from a fixed library of medical textbooks.
-
-Available specialists:
-{roster}
-
-First classify the question, then decide who is needed. Straightforward factual \
-lookups need one specialist; managing a condition usually needs several.
 
 Modes:
-  lookup      a single fact: a dose, a value, a definition, a classification
-  concept     how or why something happens: mechanism, physiology, pharmacology
-  management  how to treat, monitor or work up a condition
-  comparison  weighing two or more options against each other
-  vignette    a clinical case description to reason through
+  lookup      one fact: a dose, value, definition, criterion, classification
+  concept     how or why: mechanism, physiology, pharmacology, pathology
+  management  treatment, work-up or monitoring of a condition
+  comparison  weighing two or more drugs, options or conditions
+  vignette    a clinical case to reason through
+  mcq         a multiple-choice question with answer options
+  chat        greetings, thanks, or questions about you; needs no documents \
+(return only "standalone" and "mode")
+
+Work only from details the question contains; never invent case findings."""
+
+GRADE = """\
+You grade search results for a medical student's question. The numbered \
+PASSAGES are snippets from the student's own documents.
+
+Sub-questions to answer:
+{subquestions}
+
+Score each passage that helps answer any sub-question:
+  3  directly answers part of it: the fact, dose, criterion or mechanism itself
+  2  relevant supporting detail or necessary context
+  1  on topic but little substance
+Leave out passages that are irrelevant, and index pages, tables of contents, \
+reference lists, or figure captions with no substance.
+
+Then judge coverage: a sub-question is covered when passages you scored 2-3 \
+answer it.
 
 Return JSON:
 {
-  "reading"      : one sentence on what is actually being asked
-  "mode"         : one of lookup | concept | management | comparison | vignette
-  "depth"        : "single" for a direct lookup, "panel" for anything needing \
-several perspectives
-  "assignments"  : [{"specialist": "<key>", "brief": "the specific question this \
-specialist should answer, written as a full standalone question"}]
-  "search_terms" : 5-10 terms a textbook index would use for this topic, with \
-every abbreviation expanded
+  "scores" : {"<passage number>": <1-3>, ...},
+  "missing": [{"subquestion": <number>, "search": "a search query in textbook \
+vocabulary for exactly what is missing"}]
 }
+"missing" is empty when every sub-question is covered."""
 
-Each brief must stand entirely on its own: name the condition, the drug, the \
-patient group explicitly. The specialist sees nothing else, so resolve every \
-"it", "this" and "what about..." from the conversation into the thing it refers \
-to.
-
-Between one and four assignments. Use the keys exactly as given."""
-
-SEARCH_PLAN = """\
-You are planning how to search a library of medical textbooks for the question \
-below.
-
-Return JSON:
-{
-  "probe"    : the paragraph you would expect the textbook itself to contain in \
-answer. Confident textbook prose, technical vocabulary, four sentences at most. \
-This is a search probe, never shown to anyone; sounding like the passage being \
-looked for matters more than being right.
-  "variants" : up to {variants} rephrasings of the question as different authors \
-would write it: expand every abbreviation, swap in synonyms, use both generic \
-and brand drug names where they exist.
-  "terms"    : 3-6 short terms or phrases a textbook index would list for this \
-topic.
-}"""
-
-VIGNETTE = """\
-You are the diagnostician on a panel of doctors. A medical student has presented \
-a clinical case. Reason through it the way you would at the bedside, before \
-anything is looked up.
-
-Return JSON:
-{
-  "findings"     : one or two sentences naming the salient positives and negatives \
-in the case
-  "differential" : 3-5 entries, most likely first: [{"diagnosis": "...", \
-"for": "what in this case supports it", "against": "what argues against it"}]
-  "leading"      : the single most likely diagnosis
-  "lookups"      : 2-4 short search terms naming the candidate diagnoses and key \
-findings, for searching the library
-}
-
-Work from the case's own details. Never invent a finding the stem does not \
-contain."""
-
-SIFT = """\
-You are selecting which retrieved passages are worth reading closely.
-
-Given a question and numbered passages, return the numbers that genuinely help \
-answer it, most useful first. Discard passages that only mention the topic in \
-passing, reference lists, and figure captions with no substance.
-
-Return JSON: {"keep": [numbers]}. Keep at most {keep}. Keep fewer if fewer are \
-useful; an empty list is a valid answer."""
-
-# The consultant's follow-up questions can fall in any area, so they are
-# worked by a generalist rather than forced through one specialist's lens.
-FOLLOW_UP = "follow_up"
-FOLLOW_UP_ROLE = ("Follow-up", "whatever the question asks, in any area")
-
-SCOPE_SPECIALIST = """\
-Report what the passages say **on your area only**. Another specialist covers \
-the rest; do not stray into theirs."""
-
-SCOPE_FOLLOW_UP = """\
-This question is being asked because the panel's first pass left it open. \
-Report everything the passages say that bears on it, whatever the area."""
-
-INVESTIGATE = """\
-You are the {title} member of a panel answering from a fixed medical library.
-Your area: {focus}
-
-{scope}
+WRITE = """\
+You are an expert medical tutor answering a medical student from their own \
+documents. The <source> blocks above are the only admissible evidence: your \
+own knowledge may organise and explain, never add facts.
 
 Rules:
-  - Every statement carries its passage number, like [3].
-  - Quote figures, doses and thresholds exactly. Never round or convert.
-  - Say plainly when the passages do not cover part of your brief. A gap stated \
-is more useful than a gap filled from memory.
-  - No preamble. Findings only, as short paragraphs or bullets.
-
-If the passages contain nothing relevant to your area, reply with exactly: \
-NOTHING RELEVANT"""
-
-DRAFT = """\
-You are the registrar drafting the panel's answer from the specialists' findings.
-
-Write the answer to the question asked. Not a summary of the findings, and not a \
-section per specialist: one coherent answer that happens to draw on all of them.
-
-Rules:
-  - Keep every citation number from the findings, like [3]. Never invent one.
-  - Lead with the direct answer, then the detail that supports it.
-  - Quote doses, figures and thresholds exactly as the findings give them.
-  - Where the findings disagree, say so and attribute each position.
-  - Where the findings record a gap, say what is not covered.
-  - A CLINICAL REASONING section, when present, is the panel's own bedside \
-reading of the case, not library evidence: use it to structure the answer, but \
-every clinical claim still needs a passage citation.
-  - No preamble, no restating the question."""
-
-REVIEW = """\
-You are the senior consultant reviewing this draft before it reaches the \
-student. The numbered PASSAGES below are the only admissible evidence. You are \
-looking for what is wrong with the draft, not what is good.
-
-Check, in order:
-  1. Does every claim trace to a cited passage - and does that passage actually \
-say it? Compare against the PASSAGES provided, not your own knowledge.
-  2. Are figures, doses and thresholds reproduced exactly as the passages give \
-them?
-  3. Does it answer the question that was asked, or something adjacent?
-  4. What important aspect is missing that the library probably covers?
-
-Return JSON:
-{
-  "sound"      : true if this can go out as it stands
-  "problems"   : specific faults, each quoting the phrase at fault
-  "follow_up"  : up to 3 standalone questions worth searching the library for to \
-fix what is missing. Empty when nothing is missing.
-}
-
-Be exacting but not obstructive. A complete, well-supported answer is sound even \
-if more could theoretically be said."""
-
-FINAL = """\
-You are an attending physician sitting beside a medical student, answering from \
-the numbered passages of a textbook library. Everything you teach must come from \
-those passages; your own knowledge may organise the material, never add to it.
-
-Voice: a sharp, warm attending. Direct and concrete, never padded. Answer first, \
-reasons second, so the student always knows where they stand.
-
-Rules:
-  - Open with the direct answer to the question, its key point in **bold**.
-  - Every clinical statement carries its passage number, like [3]. A sentence \
-you cannot cite is a sentence you delete.
-  - Quote doses, figures and thresholds exactly as the PASSAGES text gives them, \
-not as the findings paraphrase them.
-  - Address the consultant's problems by fixing them. Remove anything \
-unsupported rather than softening it.
-  - Where sources disagree, present both and attribute them.
-  - Close with **Pearls**: one to three short takeaways worth carrying out of \
-the room, each cited. If the library left real gaps, add one plain sentence \
-naming them. Skip either when there is nothing worth saying.
+  - Lead with the direct answer; its key point in **bold**.
+  - Cite every clinical statement with its source id, like [2] or [2][5]. \
+A sentence you cannot cite is a sentence you leave out.
+  - Copy doses, values, thresholds and criteria exactly as the source gives \
+them: same numbers, same units. Never round, convert or combine figures.
+  - Where sources disagree, give both and attribute each.
+  - If the documents do not cover part of the question, say so in one plain \
+sentence ("Your documents don't cover ..."). Never fill a gap from memory.
+  - Explain the why: link the facts into reasoning the student can reproduce \
+in an exam or on the ward.
+  - End with **High-yield:** one to three short cited takeaways worth \
+remembering. Skip it for a one-line lookup.
+  - Answer in the language the student wrote in.
 
 {mode_guidance}
 
-Markdown: short ### headings where they help, **bold** for the terms that \
-matter, a table only for a genuine comparison, prose over bullets unless the \
-content really is a list. No preamble; never restate the question."""
+Markdown: ### headings only when the answer has distinct parts, **bold** for \
+key terms, a table only for a genuine comparison, prose over bullets unless the \
+content is a list. No preamble; never restate the question."""
 
-# How the answer should be shaped, by the kind of question asked.
 MODE_GUIDANCE = {
     "lookup": (
-        "Shape: this is a direct lookup. Give the fact in the first sentence "
-        "and the qualifying details right after. A few tight sentences, no "
-        "headings."
+        "Shape: a direct lookup. The fact in the first sentence, qualifiers "
+        "right after. A few tight sentences, no headings."
     ),
     "concept": (
         "Shape: teach the mechanism as a chain of causes - what happens, why, "
-        "and what that produces clinically. Make each causal link explicit; "
-        "that chain is what the student is trying to build."
+        "and what that produces clinically. Make every causal link explicit."
     ),
     "management": (
-        "Shape: lay out the plan in the order a clinician acts - first-line "
-        "with exact doses, then alternatives and when to switch, then "
-        "monitoring and safety checks."
+        "Shape: the plan in the order a clinician acts - first-line with exact "
+        "doses, then alternatives and when to switch, then monitoring and "
+        "safety checks (contraindications, pregnancy, interactions) where the "
+        "sources give them."
     ),
     "comparison": (
-        "Shape: compare directly rather than describing each option in turn - "
-        "a markdown table for the head-to-head facts, then a plain "
-        "recommendation of when to choose which."
+        "Shape: compare head to head - a markdown table for the facts side by "
+        "side, then when to choose which."
     ),
     "vignette": (
-        "Shape: walk the case the way a clinician thinks - key findings, the "
-        "differential and how the findings sort it, the leading diagnosis, "
-        "what confirms it, then management. Teach the reasoning at each step, "
-        "citing as you go."
+        "Shape: walk the case as a clinician thinks - the key findings, the "
+        "differential and how the findings sort it, the leading diagnosis and "
+        "what confirms it, then management. Teach the reasoning at each step."
+    ),
+    "mcq": (
+        "Shape: an exam question. First line: **Answer: <letter>. <option>**. "
+        "Then why it is right, citing sources. Then one line per other option "
+        "on why it is wrong (cite where the documents cover it; say so where "
+        "they do not). Finish with the concept the question is testing."
     ),
 }
 
+VERIFY = """\
+You check a tutor's answer against the <source> blocks above before a medical \
+student relies on it. Judge only against the sources, never your own knowledge.
+
+Report:
+  - a claim whose cited source does not say it, or says something different
+  - a number, dose, unit or threshold that differs from its source
+  - a clinical claim with no citation that the sources do not support
+Ignore style, structure and omissions. Do not report a claim that is supported.
+
+Return JSON: {"issues": [{"quote": "the exact phrase at fault", "problem": \
+"what is wrong", "fix": "the correction with the right citation, or 'remove'"}]}
+An empty list when the answer is faithful."""
+
+REPAIR = """\
+You are correcting a tutor's answer so that it is faithful to the <source> \
+blocks above. Fix every listed issue. Change only what the issues require and \
+keep everything else exactly as written, citations included. Output only the \
+full corrected answer."""
+
 SUGGEST = """\
 A medical student has just read the answer below. Suggest the follow-up \
-questions a good teacher would nudge them toward next: the natural next step in \
-understanding this topic, answerable from the same textbook library.
+questions a good tutor would nudge them toward next: the natural next step in \
+understanding the topic, likely answerable from the same documents.
 
 Return JSON: {"questions": ["...", "...", "..."]}
+Exactly 3, each short, standalone and specific. No numbering."""
 
-Exactly 3. Each short, standalone and specific - it will be searched as \
-written. No numbering inside the strings."""
+CHAT = """\
+You are a medical study assistant. You answer a medical student's questions \
+from the documents they have uploaded, citing the page each fact comes from. \
+Reply briefly and warmly to what they said; if it helps, suggest the kind of \
+question you can answer. Answer in the language they wrote in."""
+
+
+# --------------------------------------------------------------------------- #
+# data
+# --------------------------------------------------------------------------- #
 
 
 @dataclass
-class Finding:
-    specialist: str
-    title: str
-    brief: str
-    text: str
-    passages: int = 0
+class Plan:
+    question: str
+    standalone: str
+    mode: str = "concept"
+    subquestions: list[str] = field(default_factory=list)
+    probe: str = ""
+    variants: list[str] = field(default_factory=list)
+    terms: list[str] = field(default_factory=list)
+    case: dict = field(default_factory=dict)
+
+
+@dataclass
+class Graded:
+    passage: Passage
+    score: int        # 1-3 from the grader
+    rank: float       # retrieval score, for ties
 
 
 @dataclass
 class Consultation:
-    reading: str = ""
-    mode: str = "concept"
-    depth: str = "panel"
-    assignments: list[dict] = field(default_factory=list)
-    terms: list[str] = field(default_factory=list)
-    reasoning: dict = field(default_factory=dict)
-    findings: list[Finding] = field(default_factory=list)
-    draft: str = ""
-    problems: list[str] = field(default_factory=list)
-    follow_up: list[str] = field(default_factory=list)
-    revisited: bool = False
+    """What one question produced; `answer` is what gets stored."""
+    plan: Plan | None = None
+    candidates: int = 0
+    kept: int = 0
+    missing: list[str] = field(default_factory=list)
+    retried: list[str] = field(default_factory=list)
+    issues: list[dict] = field(default_factory=list)
+    repaired: bool = False
     answer: str = ""
     suggestions: list[str] = field(default_factory=list)
-
-
-def roster() -> str:
-    return "\n".join(f"  {key}: {title} - {focus}" for key, (title, focus) in SPECIALISTS.items())
 
 
 def _strings(values, limit: int) -> list[str]:
@@ -309,229 +236,328 @@ def _strings(values, limit: int) -> list[str]:
     return [str(v).strip() for v in values if str(v or "").strip()][:limit]
 
 
+# --------------------------------------------------------------------------- #
+# numbers: the cheapest accuracy check there is
+# --------------------------------------------------------------------------- #
+
+NUMBER = re.compile(r"(?<![\w.])\d+(?:[.,]\d+)?(?![\w])|\d+(?:[.,]\d+)?(?=\s?(?:mg|g|mcg|µg|ug|ml|mL|%|kg|mmol|IU|units?)\b)")
+SENTENCE = re.compile(r"(?<=[.!?])\s+|\n+")
+
+
+def _norm_number(value: str) -> str:
+    value = value.replace(",", ".")
+    return value.rstrip("0").rstrip(".") if "." in value else value
+
+
+def unsupported_figures(answer: str, cited: dict[int, Passage]) -> list[dict]:
+    """Figures in a cited sentence that appear in none of the sources it cites.
+
+    No model involved: a dose that is not in its source is wrong or invented,
+    and catching it costs nothing. Small integers (1-9) are skipped - they are
+    mostly counts and list numbers, and too common to tell anything.
+    """
+    flagged = []
+    for sentence in SENTENCE.split(answer):
+        numbers = [int(n) for n in CITATION.findall(sentence)]
+        if not numbers:
+            continue
+        sources = " ".join(cited[n].text for n in numbers if n in cited)
+        if not sources:
+            continue
+        available = {_norm_number(v) for v in NUMBER.findall(sources)}
+        body = CITATION.sub(" ", sentence)
+        missing = [
+            v for v in dict.fromkeys(NUMBER.findall(body))
+            if (len(v) > 1 or "." in v or "," in v) and _norm_number(v) not in available
+        ]
+        if missing:
+            flagged.append({"sentence": sentence.strip()[:300], "figures": missing})
+    return flagged
+
+
+# --------------------------------------------------------------------------- #
+# the tutor
+# --------------------------------------------------------------------------- #
+
+
 class Team:
     def __init__(self, settings, chat: ChatModel | None = None,
-                 retriever: Retriever | None = None) -> None:
+                 retriever: Retriever | None = None,
+                 helper: ChatModel | None = None) -> None:
         self.settings = settings
         self.chat = chat or ChatModel(settings)
+        # Planning, grading and checking need judgement, not prose: they run on
+        # the helper model when one is configured.
+        self.helper = helper or (ChatModel(settings, fast=True)
+                                 if settings.fast_model else self.chat)
         self.retriever = retriever or Retriever(settings)
         self.sources = Sources()
 
-    # -- triage ------------------------------------------------------------- #
+    # -- plan ---------------------------------------------------------------- #
 
-    def triage(self, question: str, history: list[dict]) -> Consultation:
+    def plan(self, question: str, history: list[dict]) -> Plan:
         conversation = "\n".join(
-            f"{m['role']}: {m['content'][:400]}" for m in history[-4:]
+            f"{m['role']}: {m['content'][:500]}" for m in history[-4:]
         )
-        data, ok = self.chat.structured(
-            TRIAGE.replace("{roster}", roster()),
+        data, ok = self.helper.structured(
+            PLAN.replace("{variants}", str(self.settings.query_variants)),
             f"Conversation so far:\n{conversation or '(none)'}\n\nQuestion: {question}",
-            fallback={"depth": "single", "assignments": [
-                {"specialist": "clinical", "brief": question}]},
+            fallback={},
         )
-        assignments = [
-            {
-                "specialist": a.get("specialist"),
-                "brief": str(a.get("brief") or question).strip(),
-            }
-            for a in (data.get("assignments") or [])
-            if a.get("specialist") in SPECIALISTS
-        ][: self.settings.max_specialists]
-
-        if not assignments:
-            assignments = [{"specialist": "clinical", "brief": question}]
-
         mode = str(data.get("mode") or "").strip().lower()
-        return Consultation(
-            reading=str(data.get("reading") or question),
-            mode=mode if mode in MODE_GUIDANCE else "concept",
-            depth=str(data.get("depth") or ("single" if not ok else "panel")),
-            assignments=assignments,
-            terms=_strings(data.get("search_terms"), 10),
+        standalone = str(data.get("standalone") or question).strip() or question
+        plan = Plan(
+            question=question,
+            standalone=standalone,
+            mode=mode if mode in MODES else "concept",
+            subquestions=_strings(data.get("subquestions"), 4) or [standalone],
+            probe=str(data.get("probe") or "").strip() if self.settings.use_hypothesis else "",
+            variants=_strings(data.get("variants"), self.settings.query_variants),
+            terms=_strings(data.get("terms"), 8),
         )
-
-    # -- the diagnostician, for case vignettes ------------------------------ #
-
-    def analyze_vignette(self, question: str) -> dict:
-        """Bedside reasoning before anything is looked up.
-
-        The pay-off is retrieval as much as pedagogy: a vignette never names
-        its diagnosis, so until someone commits to a differential there is
-        nothing worth searching the library for.
-        """
-        data, ok = self.chat.structured(VIGNETTE, f"The case:\n{question}", fallback={})
+        if not ok:
+            log.info("plan unparseable; searching the question as asked")
+        case = data.get("case") if isinstance(data.get("case"), dict) else {}
         differential = [
             {
                 "diagnosis": str(d.get("diagnosis") or "").strip(),
                 "for": str(d.get("for") or "").strip(),
                 "against": str(d.get("against") or "").strip(),
             }
-            for d in (data.get("differential") or [])
+            for d in (case.get("differential") or [])
             if isinstance(d, dict) and str(d.get("diagnosis") or "").strip()
         ][:5]
-        if not ok or not differential:
-            return {}
-        return {
-            "findings": str(data.get("findings") or "").strip(),
-            "differential": differential,
-            "leading": str(data.get("leading") or "").strip(),
-            "lookups": _strings(data.get("lookups"), 4),
-        }
+        if plan.mode in ("vignette", "mcq") and differential:
+            plan.case = {
+                "findings": str(case.get("findings") or "").strip(),
+                "differential": differential,
+                "leading": str(case.get("leading") or "").strip(),
+            }
+            # A case never names its diagnosis; the differential is what makes
+            # the documents searchable at all.
+            plan.terms += [d["diagnosis"] for d in differential]
+        return plan
 
     @staticmethod
-    def reasoning_text(reasoning: dict) -> str:
-        if not reasoning:
+    def case_text(case: dict) -> str:
+        if not case:
             return ""
         lines = []
-        if reasoning.get("findings"):
-            lines.append(f"Key findings: {reasoning['findings']}")
-        for entry in reasoning.get("differential", []):
+        if case.get("findings"):
+            lines.append(f"Key findings: {case['findings']}")
+        for entry in case.get("differential", []):
             line = f"- {entry['diagnosis']}"
             if entry["for"]:
                 line += f" - for: {entry['for']}"
             if entry["against"]:
                 line += f"; against: {entry['against']}"
             lines.append(line)
-        if reasoning.get("leading"):
-            lines.append(f"Leading diagnosis: {reasoning['leading']}")
+        if case.get("leading"):
+            lines.append(f"Leading: {case['leading']}")
         return "\n".join(lines)
 
-    # -- one specialist ----------------------------------------------------- #
+    # -- search and grade ---------------------------------------------------- #
 
-    def investigate(self, specialist: str, brief: str,
-                    terms: list[str] | None = None) -> Finding:
-        if specialist == FOLLOW_UP:
-            title, focus = FOLLOW_UP_ROLE
-            scope = SCOPE_FOLLOW_UP
-        else:
-            title, focus = SPECIALISTS[specialist]
-            scope = SCOPE_SPECIALIST
-
-        # One structured call plans the whole search: a hypothetical passage to
-        # embed (HyDE), rephrasings that expand abbreviations and swap synonyms,
-        # and index-style terms for keyword search. Same latency as the old
-        # hypothesis-only call, three more angles on the library.
-        probe, variants, planned = "", [], []
-        if self.settings.use_hypothesis:
-            try:
-                plan, ok = self.chat.structured(
-                    SEARCH_PLAN.replace("{variants}", str(self.settings.query_variants)),
-                    brief, fallback={},
-                )
-                if ok:
-                    probe = str(plan.get("probe") or "").strip()
-                    variants = _strings(plan.get("variants"), self.settings.query_variants)
-                    planned = _strings(plan.get("terms"), 6)
-            except Exception as exc:
-                log.info("search planning failed for %s: %s", specialist, exc)
-
-        candidates = self.retriever.search(
-            brief,
-            variants=variants,
-            hypothetical=probe or None,
-            terms=(terms or []) + planned,
+    def search(self, plan: Plan, queries: list[str] | None = None,
+               exclude: set[int] | None = None) -> list[Passage]:
+        if queries:  # a targeted second search for what the first missed
+            return self.retriever.search(
+                queries[0], variants=queries[1:], top_k=self.settings.shortlist // 2,
+                exclude=exclude,
+            )
+        return self.retriever.search(
+            plan.standalone,
+            variants=plan.subquestions + plan.variants,
+            hypothetical=plan.probe or None,
+            terms=plan.terms,
             top_k=self.settings.shortlist,
+            exclude=exclude,
         )
-        if not candidates:
-            return Finding(specialist, title, brief, "NOTHING RELEVANT", 0)
 
-        chosen = self._sift(brief, candidates)
-        if not chosen:
-            return Finding(specialist, title, brief, "NOTHING RELEVANT", 0)
+    def grade(self, plan: Plan, candidates: list[Passage]) -> tuple[list[Graded], list[dict]]:
+        """Score candidates in one call and report uncovered sub-questions.
 
-        numbered = self.sources.register(chosen)
-        report = self.chat.complete(
-            INVESTIGATE.format(title=title, focus=focus, scope=scope),
-            f"Question for you: {brief}\n\nPASSAGES\n{Sources.format(numbered)}",
-        )
-        return Finding(specialist, title, brief, report, len(numbered))
-
-    def _sift(self, brief: str, candidates: list[Passage]) -> list[Passage]:
-        """Have the model discard the near-misses that retrieval always returns.
-
-        Replaces a cross-encoder reranker, which would drag PyTorch into the
-        image for a job one cheap call does adequately.
+        One listwise call over compact snippets replaces a reranker model and
+        the old per-specialist sifting calls, and it catches gaps before any
+        writing is done rather than after.
         """
-        if len(candidates) <= self.settings.passages:
-            return candidates
+        if not candidates:
+            return [], [{"subquestion": i + 1, "search": q}
+                        for i, q in enumerate(plan.subquestions)]
         listing = "\n\n".join(
-            f"[{i}] {p.citation}\n{p.text[:600]}" for i, p in enumerate(candidates, start=1)
+            f"[{i}] {p.citation}" + (f" - {p.section}" if p.section else "")
+            + f"\n{p.text[:900]}"
+            for i, p in enumerate(candidates, start=1)
         )
-        data, ok = self.chat.structured(
-            SIFT.replace("{keep}", str(self.settings.passages)),
-            f"Question: {brief}\n\nPASSAGES\n{listing}",
+        subquestions = "\n".join(f"{i}. {q}" for i, q in enumerate(plan.subquestions, start=1))
+        data, ok = self.helper.structured(
+            GRADE.replace("{subquestions}", subquestions),
+            f"Question: {plan.standalone}\n\nPASSAGES\n{listing}",
             fallback={},
         )
         if not ok:
-            return candidates[: self.settings.passages]
-        keep = [
-            candidates[int(n) - 1]
-            for n in (data.get("keep") or [])
-            if str(n).isdigit() and 1 <= int(n) <= len(candidates)
-        ]
-        return keep[: self.settings.passages]
+            # No grades: trust retrieval order, keep the top of it.
+            return [Graded(p, 2, p.score) for p in candidates[: self.settings.passages]], []
 
-    # -- review ------------------------------------------------------------- #
+        graded = []
+        scores = data.get("scores") if isinstance(data.get("scores"), dict) else {}
+        for key, value in scores.items():
+            try:
+                index, score = int(str(key).strip("[] ")), int(value)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= index <= len(candidates) and score >= 1:
+                passage = candidates[index - 1]
+                graded.append(Graded(passage, min(score, 3), passage.score))
+        missing = [
+            m for m in (data.get("missing") or [])
+            if isinstance(m, dict) and str(m.get("search") or "").strip()
+        ][:3]
+        return graded, missing
 
-    def review(self, question: str, draft: str) -> tuple[bool, list[str], list[str]]:
-        # The reviewer gets the passages the draft cites; without them, "does
-        # every claim trace to its passage" would be a question it answers from
-        # its own general knowledge, which is exactly what it must not do.
-        evidence = self.evidence(draft)
-        data, ok = self.chat.structured(
-            REVIEW,
-            f"Question asked: {question}\n\nPASSAGES\n{evidence or '(none cited)'}"
-            f"\n\nDraft answer:\n{draft}",
-            fallback={"sound": True},
+    # -- pack ---------------------------------------------------------------- #
+
+    def pack(self, graded: list[Graded]) -> list[Passage]:
+        """Choose, widen and merge evidence within the token budget.
+
+        Strongest passages go in first. The best ones are then widened with the
+        passages either side of them, which restores the sentence that
+        qualifies a dose without sending the whole section. Passages that touch
+        are merged into one source, so overlapping text is sent once.
+        """
+        budget = self.settings.evidence_tokens
+        ranked = sorted(graded, key=lambda g: (g.score, g.rank), reverse=True)
+        ranked = [g for g in ranked if g.score >= 2] or ranked[:3]
+        ranked = ranked[: self.settings.passages]
+
+        chosen: dict[int, Passage] = {}
+        strength: dict[int, float] = {}
+        used = 0
+        for g in ranked:
+            tokens = count_tokens(g.passage.text)
+            if chosen and used + tokens > budget:
+                continue
+            chosen[g.passage.id] = g.passage
+            strength[g.passage.id] = g.score + g.rank
+            used += tokens
+
+        # Widen the strongest hits while the budget allows.
+        best = [g.passage.id for g in ranked if g.score == 3 and g.passage.id in chosen][:6]
+        if best and used < budget:
+            around = self.retriever.neighbours(best)
+            for hit in best:
+                for side in (hit - 1, hit + 1):
+                    neighbour = around.get(side)
+                    if (neighbour is None or side in chosen
+                            or neighbour.document_id != chosen[hit].document_id):
+                        continue
+                    tokens = count_tokens(neighbour.text)
+                    if used + tokens > budget:
+                        continue
+                    chosen[side] = neighbour
+                    strength[side] = strength[hit] - 0.5
+                    used += tokens
+
+        spans = _merge_runs(chosen, strength)
+        log.info("evidence: %d passages -> %d sources, ~%d tokens", len(chosen), len(spans), used)
+        return spans
+
+    # -- write, check, correct ------------------------------------------------ #
+
+    def evidence_block(self, numbered: list[tuple[int, Passage]]) -> str:
+        return ("SOURCES - excerpts from the student's own documents\n\n"
+                + Sources.format(numbered, compact=True))
+
+    def brief(self, plan: Plan, missing: list[str]) -> str:
+        """The writer's user message: the question plus what it must know."""
+        parts = [f"Question: {plan.question}"]
+        if plan.standalone != plan.question:
+            parts.append(f"(In full: {plan.standalone})")
+        case = self.case_text(plan.case)
+        if case:
+            parts.append(
+                "Bedside reading of the case (yours, not evidence - every "
+                f"clinical claim still needs a source):\n{case}")
+        if missing:
+            parts.append("Searched for but not found in the documents:\n- "
+                         + "\n- ".join(missing))
+        return "\n\n".join(parts)
+
+    def write_system(self, mode: str) -> str:
+        return WRITE.replace("{mode_guidance}", MODE_GUIDANCE.get(mode, MODE_GUIDANCE["concept"]))
+
+    def verify(self, answer: str, evidence: str) -> list[dict]:
+        """Issues with the answer: figures first (free), then one model check."""
+        figures = unsupported_figures(answer, self.sources.passages())
+        hints = ""
+        if figures:
+            hints = "\n\nAn automatic check found figures absent from the sources " \
+                    "their sentence cites (check each; some may be legitimate):\n" + \
+                "\n".join(f"- {', '.join(f['figures'])} in: {f['sentence']}" for f in figures)
+        data, ok = self.helper.structured(
+            VERIFY, f"ANSWER TO CHECK\n{answer}{hints}", fallback={}, context=evidence,
         )
-        if not ok:
-            return True, [], []
-        problems = [str(p) for p in (data.get("problems") or [])][:5]
-        follow_up = _strings(data.get("follow_up"), 3)
-        return bool(data.get("sound", True)), problems, follow_up
+        issues = [
+            {k: str(i.get(k) or "").strip() for k in ("quote", "problem", "fix")}
+            for i in (data.get("issues") or []) if isinstance(i, dict)
+        ] if ok else []
+        return [i for i in issues if i["quote"] or i["problem"]][:8]
 
-    def evidence(self, *texts: str) -> str:
-        """The passages the given texts cite, formatted for exact quoting."""
-        referenced = self.sources.referenced(*texts)[: self.settings.evidence_limit]
-        return Sources.format(referenced, compact=True)
-
-    # -- after the answer ---------------------------------------------------- #
+    def repair(self, answer: str, issues: list[dict], evidence: str) -> str:
+        listing = "\n".join(
+            f"- \"{i['quote']}\": {i['problem']}" + (f" -> {i['fix']}" if i["fix"] else "")
+            for i in issues
+        )
+        return self.chat.complete(
+            REPAIR, f"ANSWER\n{answer}\n\nISSUES\n{listing}", context=evidence,
+        )
 
     def suggest(self, question: str, answer: str) -> list[str]:
-        """Three follow-up questions a good teacher would prompt next."""
-        data, ok = self.chat.structured(
-            SUGGEST,
-            f"Question: {question}\n\nAnswer:\n{answer[:4000]}",
-            fallback={},
+        data, ok = self.helper.structured(
+            SUGGEST, f"Question: {question}\n\nAnswer:\n{answer[:3000]}", fallback={},
         )
-        if not ok:
-            return []
-        return _strings(data.get("questions"), 3)
+        return _strings(data.get("questions"), 3) if ok else []
 
-    def follow_up_search(self, questions: list[str]) -> list[Finding]:
-        findings = []
-        with ThreadPoolExecutor(max_workers=min(3, len(questions))) as pool:
-            futures = {
-                pool.submit(self.investigate, FOLLOW_UP, question): question
-                for question in questions
-            }
-            for future in as_completed(futures):
-                try:
-                    finding = future.result()
-                except Exception as exc:
-                    log.warning("follow-up failed: %s", exc)
-                    continue
-                if finding.text.strip() != "NOTHING RELEVANT":
-                    findings.append(finding)
-        return findings
 
-    # -- assembly ----------------------------------------------------------- #
+def _merge_runs(chosen: dict[int, Passage], strength: dict[int, float]) -> list[Passage]:
+    """Merge consecutive passages of one document into single sources.
 
-    @staticmethod
-    def collate(findings: list[Finding]) -> str:
-        blocks = [
-            f"### {f.title}\nBrief: {f.brief}\n\n{f.text}"
-            for f in findings
-            if f.text.strip() and f.text.strip() != "NOTHING RELEVANT"
-        ]
-        return "\n\n".join(blocks)
+    Each stored passage repeats the last few words of the one before it (the
+    overlap that keeps sentences whole at boundaries); that repeat is dropped
+    when the two are joined.
+    """
+    by_document: dict[int, list[Passage]] = {}
+    for passage in chosen.values():
+        by_document.setdefault(passage.document_id, []).append(passage)
+
+    spans: list[tuple[float, Passage]] = []
+    for passages in by_document.values():
+        passages.sort(key=lambda p: p.id)
+        run: list[Passage] = []
+        for passage in passages + [None]:
+            if passage is not None and run and passage.id == run[-1].id + 1:
+                run.append(passage)
+                continue
+            if run:
+                spans.append((max(strength[p.id] for p in run), _join(run)))
+            run = [passage] if passage is not None else []
+    spans.sort(key=lambda s: s[0], reverse=True)
+    return [span for _, span in spans]
+
+
+def _join(run: list[Passage]) -> Passage:
+    text = run[0].text
+    for passage in run[1:]:
+        piece = passage.text
+        head, _, rest = piece.partition("\n\n")
+        head_words = head.split()
+        if rest and head_words and text.split()[-len(head_words):] == head_words:
+            piece = rest
+        text = f"{text}\n\n{piece}"
+    first = run[0]
+    return Passage(
+        id=first.id, text=text, parent_text=text, section=first.section,
+        page_start=min(p.page_start for p in run), page_end=max(p.page_end for p in run),
+        filename=first.filename, year=first.year, score=first.score,
+        signals=first.signals, document_id=first.document_id,
+    )

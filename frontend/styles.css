@@ -531,3 +531,16 @@ button { font: inherit; cursor: pointer; border: none; background: none; color: 
 @media (max-width: 560px) {
   .segmented.four { grid-template-columns: repeat(2, 1fr); }
 }
+
+/* research trace v2 */
+.trace summary { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; }
+.trace summary .sep { opacity: .5; }
+.trace .badge-mode { font-weight: 600; color: var(--text); }
+.trace .strength.strong { color: var(--accent); font-weight: 600; }
+.trace .strength.partial { color: #8a5a00; font-weight: 600; }
+.trace .strength.limited, .trace .strength.none { color: var(--danger); font-weight: 600; }
+.trace .checked { color: var(--accent); }
+@media (prefers-color-scheme: dark) { .trace .strength.partial { color: #f0c274; } }
+.panel-members .sq { font-size: 12.5px; line-height: 1.45; }
+.trace .review.ok { color: var(--accent); font-size: 12.5px; }
+.helper-field { margin: 14px 0 0; }

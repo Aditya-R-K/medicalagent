@@ -47,7 +47,7 @@
         <div class="empty" id="empty-state">
           <div class="empty-icon">🩺</div>
           <h2>Ask about your documents</h2>
-          <p>Every answer cites the document and page it came from.</p>
+          <p>Ask a question, paste a clinical case, or paste an exam MCQ with its options. Every answer cites the page it came from and is fact-checked against it.</p>
           <div class="suggestions" id="suggestions"></div>
         </div>
       </div>
@@ -121,6 +121,10 @@
             </div>
             <input type="text" class="custom-model" id="chat-model-custom" placeholder="Model name" hidden>
             <p class="hint" id="chat-note"></p>
+            <label class="field helper-field">
+              <span class="field-label">Helper model <span class="hint-inline">plans the search, ranks passages and fact-checks; a cheaper, faster model here cuts cost</span></span>
+              <select id="fast-model" aria-label="Helper model"></select>
+            </label>
           </section>
 
           <section class="field-group">

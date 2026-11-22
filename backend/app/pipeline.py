@@ -1,28 +1,47 @@
-"""Runs a question past the specialist panel and streams what happens.
+"""Runs one question through the tutor and streams what happens.
 
-Simple lookups take the short path: one specialist, straight to the answer.
-Anything needing more than one perspective goes through the full consultation -
-parallel investigation, a draft, a consultant's review, and a second search for
-whatever the review found missing. Case vignettes get a bedside-reasoning step
-first, so the library is searched for the differential rather than the stem.
+    plan -> search -> grade -> (one corrective search if something is missing)
+         -> pack evidence -> write (streamed) -> verify -> correct if needed
+
+A typical question costs four to six model calls, and the evidence is sent as
+one identical block that providers cache across the writer, checker and
+corrector. Greetings and thanks skip the documents entirely.
 """
 
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from typing import Iterator
 
 from .providers import ChatModel
 from .retrieve import CITATION, Retriever
-from .team import DRAFT, FINAL, MODE_GUIDANCE, SPECIALISTS, Consultation, Team
+from .team import CHAT, Consultation, Team
 
 log = logging.getLogger(__name__)
 
 NOTHING_FOUND = (
-    "Nothing in the indexed documents covers this. Try rephrasing, or check "
-    "that the relevant document has finished indexing."
+    "I couldn't find this in your documents. Try rephrasing with the terms your "
+    "textbook would use, or check in **Documents** that the relevant file has "
+    "finished indexing."
 )
+
+
+def _subquestion(entry: dict) -> int:
+    """The 1-based sub-question a grader's "missing" entry refers to, or 0."""
+    try:
+        return int(str(entry.get("subquestion") or 0).strip())
+    except ValueError:
+        return 0
+
+
+def evidence_strength(graded, missing) -> str:
+    strong = sum(1 for g in graded if g.score == 3)
+    if not graded:
+        return "none"
+    if not missing and strong >= 1:
+        return "strong"
+    return "partial" if strong or len(graded) >= 2 else "limited"
 
 
 class Pipeline:
@@ -32,9 +51,8 @@ class Pipeline:
         self.team = Team(settings, chat, retriever)
 
     def answer(self, question: str, history: list[dict] | None = None) -> Iterator[dict]:
-        # Earlier answers carry citation numbers from their own consultations.
-        # Stripped, so the writer cannot reuse a [3] that now means a different
-        # passage.
+        # Earlier answers carry citation numbers from their own sources;
+        # stripped, so the writer cannot reuse a [3] that now means another.
         history = [
             {"role": m["role"], "content": CITATION.sub("", m["content"])}
             for m in (history or [])
@@ -42,166 +60,144 @@ class Pipeline:
         team = self.team
         result = Consultation()
 
-        yield {"type": "status", "text": "Reading the question"}
+        # -- plan ------------------------------------------------------------ #
+        yield {"type": "status", "text": "Understanding the question"}
         try:
-            result = team.triage(question, history)
+            plan = team.plan(question, history)
         except Exception as exc:
-            log.exception("triage failed")
+            log.exception("planning failed")
             yield {"type": "error", "text": str(exc)}
             return
+        result.plan = plan
+        yield {"type": "plan", "reading": plan.standalone, "mode": plan.mode,
+               "subquestions": plan.subquestions}
 
-        members = [
-            {"key": a["specialist"], "title": SPECIALISTS[a["specialist"]][0],
-             "brief": a["brief"]}
-            for a in result.assignments
-        ]
-        yield {"type": "team", "reading": result.reading, "mode": result.mode,
-               "members": members}
+        if plan.mode == "chat":
+            yield from self._chat(question, history, result)
+            return
+        if plan.case:
+            yield {"type": "reasoning", **plan.case}
 
-        # -- bedside reasoning first, for case vignettes --------------------- #
-        if result.mode == "vignette":
-            yield {"type": "status", "text": "Working through the case"}
-            try:
-                result.reasoning = team.analyze_vignette(question)
-            except Exception as exc:
-                log.warning("vignette analysis failed: %s", exc)
-            if result.reasoning:
-                yield {"type": "reasoning", **result.reasoning}
+        # -- search and grade ---------------------------------------------- #
+        yield {"type": "status", "text": "Searching your documents"}
+        candidates = team.search(plan)
+        result.candidates = len(candidates)
+        yield {"type": "status", "text": f"Ranking {len(candidates)} passages"}
+        graded, missing = team.grade(plan, candidates)
 
-        # Topic terms from triage, plus the differential's diagnosis names for a
-        # vignette - the stem never names the diagnosis, so those terms are what
-        # make the library searchable at all.
-        terms = result.terms + result.reasoning.get("lookups", [])
+        # One corrective search, only for what grading found missing. Gaps are
+        # found before writing, which is far cheaper than drafting, reviewing
+        # and searching again afterwards.
+        if missing and self.settings.enable_review:
+            queries = [str(m["search"]).strip() for m in missing]
+            result.retried = queries
+            yield {"type": "status", "text": "Looking again for: " + "; ".join(queries)}
+            seen = {p.id for p in candidates}
+            extra = team.search(plan, queries=queries, exclude=seen)
+            result.candidates += len(extra)
+            if extra:
+                more, still = team.grade(plan, extra)
+                graded += more
+                still_open = {_subquestion(m) for m in still}
+                if more:
+                    missing = [m for m in missing if _subquestion(m) in still_open]
 
-        # -- specialists work in parallel; report each as it lands ----------- #
-        pending = len(result.assignments)
-        yield {"type": "status",
-               "text": f"Consulting {pending} specialist{'s' if pending > 1 else ''}"}
+        result.missing = list(dict.fromkeys(
+            plan.subquestions[_subquestion(m) - 1]
+            if 1 <= _subquestion(m) <= len(plan.subquestions)
+            else str(m.get("search"))
+            for m in missing
+        ))
 
-        with ThreadPoolExecutor(max_workers=min(4, pending)) as pool:
-            futures = {
-                pool.submit(team.investigate, a["specialist"], a["brief"], terms): a
-                for a in result.assignments
-            }
-            for future in as_completed(futures):
-                assignment = futures[future]
-                try:
-                    finding = future.result()
-                except Exception as exc:
-                    log.exception("specialist %s failed", assignment["specialist"])
-                    yield {"type": "status",
-                           "text": f"{assignment['specialist']} could not report: {exc}"}
-                    continue
-                result.findings.append(finding)
-                found = finding.text.strip() != "NOTHING RELEVANT"
-                yield {
-                    "type": "finding",
-                    "specialist": finding.specialist,
-                    "title": finding.title,
-                    "passages": finding.passages,
-                    "found": found,
-                }
+        spans = team.pack(graded) if graded else []
+        result.kept = len(spans)
+        strength = evidence_strength(graded, missing)
+        yield {"type": "evidence", "candidates": result.candidates, "sources": len(spans),
+               "strength": strength, "missing": result.missing, "retried": result.retried}
 
-        collated = team.collate(result.findings)
-        if not collated:
-            searched = "; ".join(dict.fromkeys(a["brief"] for a in result.assignments))
-            text = NOTHING_FOUND + (
-                f"\n\nThe panel searched for: {searched}" if searched else ""
-            )
+        if not spans:
             yield {"type": "citations", "citations": []}
-            yield {"type": "token", "text": text}
-            result.answer = text
+            yield {"type": "token", "text": NOTHING_FOUND}
+            result.answer = NOTHING_FOUND
             yield {"type": "complete", "result": result}
             return
 
-        # The panel's own reading of a case is context for the writers, but it
-        # is not evidence: claims still need passage citations.
-        context = f"Question: {question}\n\n"
-        reasoning = team.reasoning_text(result.reasoning)
-        if reasoning:
-            context += (
-                "CLINICAL REASONING (the panel's own reading of the case, not "
-                f"library evidence)\n{reasoning}\n\n"
-            )
-
-        # -- draft and review, for anything beyond a direct lookup ----------- #
-        single = result.depth == "single" or len(result.findings) == 1
-        if not single and self.settings.enable_review:
-            yield {"type": "status", "text": "Drafting the answer"}
-            try:
-                result.draft = team.chat.complete(DRAFT, f"{context}FINDINGS\n{collated}")
-            except Exception as exc:
-                log.warning("draft failed: %s", exc)
-
-            if result.draft:
-                yield {"type": "status", "text": "Senior review"}
-                # A failed review must not discard the panel's work: the
-                # findings and draft still make an answer.
-                try:
-                    sound, problems, follow_up = team.review(question, result.draft)
-                except Exception as exc:
-                    log.warning("review failed: %s", exc)
-                    sound, problems, follow_up = True, [], []
-                result.problems, result.follow_up = problems, follow_up
-                yield {"type": "review", "sound": sound, "problems": problems,
-                       "follow_up": follow_up}
-
-                if follow_up:
-                    result.revisited = True
-                    yield {"type": "status",
-                           "text": f"Going back for {len(follow_up)} open point"
-                                   f"{'s' if len(follow_up) > 1 else ''}"}
-                    extra = team.follow_up_search(follow_up)
-                    result.findings.extend(extra)
-                    collated = team.collate(result.findings)
-                    yield {"type": "status",
-                           "text": f"{len(extra)} further finding"
-                                   f"{'s' if len(extra) != 1 else ''}"}
-
-        # -- final answer ---------------------------------------------------- #
+        numbered = team.sources.register(spans)
+        evidence = team.evidence_block(numbered)
         yield {"type": "citations", "citations": team.sources.all()}
+
+        # -- write ----------------------------------------------------------- #
         yield {"type": "status", "text": "Writing the answer"}
-
-        system = FINAL.replace(
-            "{mode_guidance}", MODE_GUIDANCE.get(result.mode, MODE_GUIDANCE["concept"])
-        )
-        prompt = f"{context}FINDINGS\n{collated}"
-        # The writer quotes doses from the passages themselves, not from the
-        # findings' paraphrase of them.
-        evidence = team.evidence(collated, result.draft)
-        if evidence:
-            prompt += f"\n\nPASSAGES (quote figures and doses from these)\n{evidence}"
-        if result.draft:
-            prompt += f"\n\nDRAFT\n{result.draft}"
-        if result.problems:
-            prompt += "\n\nCONSULTANT'S PROBLEMS\n- " + "\n- ".join(result.problems)
-
         collected: list[str] = []
         try:
-            for piece in team.chat.stream(system, prompt, history[-4:]):
+            for piece in team.chat.stream(
+                team.write_system(plan.mode), team.brief(plan, result.missing),
+                history[-4:], context=evidence,
+            ):
                 collected.append(piece)
                 yield {"type": "token", "text": piece}
         except Exception as exc:
-            log.exception("final answer failed")
+            log.exception("writing failed")
             yield {"type": "error", "text": str(exc)}
             return
 
         raw = "".join(collected)
-        result.answer = team.sources.sanitize(raw)
-        if result.answer != raw:
-            # The stream already carried the invented markers; hand the
-            # interface the corrected text to re-render and store.
-            yield {"type": "answer", "text": result.answer}
+        answer = team.sources.sanitize(raw)
 
-        # Narrow the citation list to what the answer actually refers to.
-        yield {"type": "citations", "citations": team.sources.cited(result.answer)}
+        # -- verify (and suggest, in parallel) ------------------------------ #
+        check = self.settings.enable_review
+        if check:
+            yield {"type": "status", "text": "Checking every claim against the sources"}
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            verifying = pool.submit(team.verify, answer, evidence) if check else None
+            suggesting = (pool.submit(team.suggest, question, answer)
+                          if self.settings.enable_suggestions else None)
+            issues = []
+            if verifying:
+                try:
+                    issues = verifying.result()
+                except Exception as exc:
+                    log.warning("verification failed: %s", exc)
+            result.issues = issues
 
-        if self.settings.enable_suggestions:
-            try:
-                result.suggestions = team.suggest(question, result.answer)
-            except Exception as exc:
-                log.info("suggestions failed: %s", exc)
-            if result.suggestions:
-                yield {"type": "suggestions", "questions": result.suggestions}
+            if issues:
+                yield {"type": "status",
+                       "text": f"Correcting {len(issues)} point{'s' if len(issues) > 1 else ''}"}
+                try:
+                    fixed = team.sources.sanitize(team.repair(answer, issues, evidence))
+                    if fixed.strip():
+                        answer, result.repaired = fixed, True
+                except Exception as exc:
+                    log.warning("correction failed: %s", exc)
 
+            if suggesting:
+                try:
+                    result.suggestions = suggesting.result()
+                except Exception as exc:
+                    log.info("suggestions failed: %s", exc)
+
+        result.answer = answer
+        if answer != raw:
+            # The stream carried the uncorrected text; hand the interface the
+            # final version to re-render and store.
+            yield {"type": "answer", "text": answer}
+        if check:
+            yield {"type": "verify", "issues": issues, "repaired": result.repaired}
+        yield {"type": "citations", "citations": team.sources.cited(answer)}
+        if result.suggestions:
+            yield {"type": "suggestions", "questions": result.suggestions}
+        yield {"type": "complete", "result": result}
+
+    def _chat(self, question: str, history: list[dict], result: Consultation) -> Iterator[dict]:
+        """Greetings and thanks: a short reply, no documents, no citations."""
+        yield {"type": "citations", "citations": []}
+        collected: list[str] = []
+        try:
+            for piece in self.team.chat.stream(CHAT, question, history[-4:]):
+                collected.append(piece)
+                yield {"type": "token", "text": piece}
+        except Exception as exc:
+            yield {"type": "error", "text": str(exc)}
+            return
+        result.answer = "".join(collected)
         yield {"type": "complete", "result": result}

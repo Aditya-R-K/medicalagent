@@ -191,7 +191,7 @@ function showEmptyState() {
   empty.innerHTML = `
     <div class="empty-icon">🩺</div>
     <h2>Ask about your documents</h2>
-    <p>Every answer cites the document and page it came from.</p>`;
+    <p>Ask a question, paste a clinical case, or paste an exam MCQ with its options. Every answer cites the page it came from and is fact-checked against it.</p>`;
   $('messages').appendChild(empty);
 }
 
@@ -224,6 +224,14 @@ async function ensureChat() {
 
 /* ------------------------------------------------------------- questions */
 
+const MODE_LABEL = {
+  lookup: 'Quick lookup', concept: 'Concept', management: 'Management',
+  comparison: 'Comparison', vignette: 'Clinical case', mcq: 'Exam question',
+};
+const STRENGTH_LABEL = {
+  strong: 'strong evidence', partial: 'partial evidence', limited: 'limited evidence', none: 'no evidence',
+};
+
 async function ask(question) {
   if (state.streaming || !question.trim()) return;
   const chatId = await ensureChat();
@@ -243,22 +251,19 @@ async function ask(question) {
 
   let answer = '';
   let citations = [];
-  const trace = { members: [], findings: [], review: null, reasoning: null, suggestions: [] };
+  const trace = { plan: null, reasoning: null, evidence: null, verify: null, suggestions: [] };
 
   const traceHtml = () => {
-    if (!trace.members.length) return '';
-    const members = trace.members
-      .map((m) => {
-        const finding = trace.findings.find((f) => f.specialist === m.key);
-        const mark = !finding ? '<span class="spin"></span>'
-          : finding.found ? '<span class="tick">✓</span>'
-          : '<span class="none">—</span>';
-        const note = finding
-          ? (finding.found ? `${finding.passages} passages` : 'nothing relevant')
-          : 'working…';
-        return `<li>${mark}<strong>${escapeHtml(m.title)}</strong>
-                  <span class="brief">${escapeHtml(m.brief)}</span>
-                  <span class="note">${note}</span></li>`;
+    if (!trace.plan || trace.plan.mode === 'chat') return '';
+    const ev = trace.evidence;
+    const missing = new Set(ev?.missing || []);
+    const subquestions = (trace.plan.subquestions || [])
+      .map((q) => {
+        const open = missing.has(q);
+        const mark = !ev ? '<span class="spin"></span>'
+          : open ? '<span class="none">○</span>' : '<span class="tick">✓</span>';
+        const note = !ev ? 'searching…' : open ? 'not in your documents' : 'covered';
+        return `<li>${mark}<span class="sq">${escapeHtml(q)}</span><span class="note">${note}</span></li>`;
       })
       .join('');
     const reasoning = trace.reasoning
@@ -273,19 +278,28 @@ async function ask(question) {
             ? `<p class="leading">Leading diagnosis: <strong>${escapeHtml(trace.reasoning.leading)}</strong></p>`
             : ''}</div>`
       : '';
-    const problems = trace.review?.problems?.length
-      ? `<div class="review"><strong>Review found:</strong><ul>${
-          trace.review.problems.map((p) => `<li>${escapeHtml(p)}</li>`).join('')
+    const retried = ev?.retried?.length
+      ? `<div class="review"><strong>Looked again for:</strong><ul>${
+          ev.retried.map((q) => `<li>${escapeHtml(q)}</li>`).join('')
         }</ul></div>`
       : '';
-    const followUp = trace.review?.follow_up?.length
-      ? `<div class="review"><strong>Went back for:</strong><ul>${
-          trace.review.follow_up.map((q) => `<li>${escapeHtml(q)}</li>`).join('')
-        }</ul></div>`
-      : '';
+    const issues = trace.verify?.issues || [];
+    const verify = !trace.verify ? ''
+      : issues.length
+        ? `<div class="review"><strong>Fact-check ${trace.verify.repaired ? 'corrected' : 'flagged'}:</strong><ul>${
+            issues.map((i) => `<li>${i.quote ? `“${escapeHtml(i.quote)}” — ` : ''}${escapeHtml(i.problem)}</li>`).join('')
+          }</ul></div>`
+        : '<div class="review ok">✓ Every claim checked against its cited source</div>';
+
+    const badges = [
+      `<span class="badge-mode">${escapeHtml(MODE_LABEL[trace.plan.mode] || trace.plan.mode)}</span>`,
+      ev ? `<span>${ev.sources} source${ev.sources === 1 ? '' : 's'}</span>` : '<span>searching…</span>',
+      ev ? `<span class="strength ${ev.strength}">${STRENGTH_LABEL[ev.strength] || ''}</span>` : '',
+      trace.verify ? `<span class="checked">${issues.length && !trace.verify.repaired ? '⚠ check flagged' : '✓ fact-checked'}</span>` : '',
+    ].filter(Boolean).join('<span class="sep">·</span>');
     return `<details class="trace"${state.streaming ? ' open' : ''}>
-        <summary>Consultation · ${trace.members.length} specialist${trace.members.length > 1 ? 's' : ''}</summary>
-        ${reasoning}<ul class="panel-members">${members}</ul>${problems}${followUp}
+        <summary>${badges}</summary>
+        ${reasoning}<ul class="panel-members">${subquestions}</ul>${retried}${verify}
       </details>`;
   };
 
@@ -325,23 +339,14 @@ async function ask(question) {
           turn.innerHTML = traceHtml() +
             `<div class="status"><span class="dot"></span><span>${escapeHtml(event.text)}</span></div>`;
           scrollDown();
-        } else if (event.type === 'team') {
-          trace.members = event.members;
-          turn.innerHTML = traceHtml() +
-            '<div class="status"><span class="dot"></span><span>Consulting</span></div>';
-          scrollDown();
-        } else if (event.type === 'finding') {
-          trace.findings.push(event);
-          turn.innerHTML = traceHtml() +
-            '<div class="status"><span class="dot"></span><span>Consulting</span></div>';
-          scrollDown();
+        } else if (event.type === 'plan') {
+          trace.plan = event;
         } else if (event.type === 'reasoning') {
           trace.reasoning = event;
-          turn.innerHTML = traceHtml() +
-            '<div class="status"><span class="dot"></span><span>Working through the case</span></div>';
-          scrollDown();
-        } else if (event.type === 'review') {
-          trace.review = event;
+        } else if (event.type === 'evidence') {
+          trace.evidence = event;
+        } else if (event.type === 'verify') {
+          trace.verify = event;
         } else if (event.type === 'citations') {
           citations = event.citations;
         } else if (event.type === 'token') {
@@ -468,6 +473,7 @@ const settingsUi = {
   embedProvider: 'openai',
   lists: { chat: {}, embedding: {} },    // kind -> provider -> models
   choice: { chat: {}, embedding: {} },   // kind -> provider -> model picked this session
+  fastChoice: {},                        // provider -> helper model picked this session
   loading: {},
 };
 
@@ -502,6 +508,18 @@ function fillModels(kind, list, selected) {
     `<option value="${CUSTOM}">Other (type a name)…</option>`;
   select.value = names.length ? (selected || names[0]) : CUSTOM;
   $(cid).hidden = select.value !== CUSTOM;
+}
+
+/* The helper model: same provider as the answer model, optional. */
+function fillHelper() {
+  const provider = settingsUi.chatProvider;
+  const select = $('fast-model');
+  const saved = settingsUi.fastChoice[provider] ?? settingsUi.config.providers[provider]?.fast_model ?? '';
+  const names = [...new Set(settingsUi.lists.chat[provider] || [])];
+  if (saved && !names.includes(saved)) names.unshift(saved);
+  select.innerHTML = '<option value="">Same as answer model</option>' +
+    names.map((n) => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`).join('');
+  select.value = saved;
 }
 
 function chosen(kind) {
@@ -565,6 +583,10 @@ async function refreshModels(kind, { quiet = false } = {}) {
     const models = await fetchModels(provider, kind);
     if (currentProvider(kind) !== provider) return;
     fillModels(kind, models, chosen(kind));
+    if (kind === 'chat') {
+      settingsUi.fastChoice[provider] = $('fast-model').value;
+      fillHelper();
+    }
     if (!quiet) {
       setSettingsMessage(`${label(provider)}: ${models.length} ${kind === 'embedding' ? 'embedding ' : ''}model${models.length === 1 ? '' : 's'} available.`, 'ok');
     }
@@ -584,6 +606,7 @@ async function refreshModels(kind, { quiet = false } = {}) {
 function selectProvider(kind, provider) {
   const previous = currentProvider(kind);
   if (previous) settingsUi.choice[kind][previous] = chosen(kind);
+  if (previous && kind === 'chat') settingsUi.fastChoice[previous] = $('fast-model').value;
   if (kind === 'chat') settingsUi.chatProvider = provider;
   else settingsUi.embedProvider = provider;
 
@@ -597,8 +620,12 @@ function selectProvider(kind, provider) {
     : (config.embedding.provider === provider ? config.embedding.model : DEFAULT_EMBED[provider]);
   fillModels(kind, settingsUi.lists[kind][provider], settingsUi.choice[kind][provider] || saved);
 
-  if (kind === 'chat') renderChatNote();
-  else renderEmbedWarning();
+  if (kind === 'chat') {
+    renderChatNote();
+    fillHelper();
+  } else {
+    renderEmbedWarning();
+  }
 
   if (!canReach(provider, kind)) {
     setSettingsMessage(`Add your ${label(provider)} key in the API keys tab to list its models.`, 'bad');
@@ -742,6 +769,7 @@ function applyConfig(config, { keepSelection = false } = {}) {
     b.classList.toggle('active-provider', b.dataset.provider === config.embedding.provider));
   if (!keepSelection) {
     settingsUi.choice = { chat: {}, embedding: {} };
+    settingsUi.fastChoice = {};
     settingsUi.chatProvider = null;
     settingsUi.embedProvider = null;
     selectProvider('chat', config.llm_provider in PROVIDERS ? config.llm_provider : 'openai');
@@ -784,6 +812,7 @@ async function saveSettings() {
   const body = {
     llm_provider: chatProvider,
     [`${chatProvider}_chat_model`]: chatModel,
+    [`${chatProvider}_fast_model`]: $('fast-model').value, // '' = same as answer model
     embed_provider: settingsUi.embedProvider,
     embed_model: embedModel,
     openai_base_url: $('openai-base').value.trim(),

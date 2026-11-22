@@ -8,7 +8,7 @@ work as defaults, for deployments that prefer them.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # pgvector's HNSW index cannot cover more than 2000 dimensions. Wider models are
@@ -52,6 +52,11 @@ EDITABLE = {
     "ollama_chat_model": "OLLAMA_CHAT_MODEL",
     "embed_provider": "EMBED_PROVIDER",
     "embed_model": "EMBED_MODEL",
+    # Optional cheaper model per provider for planning, grading and checking.
+    "openai_fast_model": "OPENAI_FAST_MODEL",
+    "anthropic_fast_model": "ANTHROPIC_FAST_MODEL",
+    "nvidia_fast_model": "NVIDIA_FAST_MODEL",
+    "ollama_fast_model": "OLLAMA_FAST_MODEL",
 }
 SECRETS = ("openai_api_key", "anthropic_api_key", "nvidia_api_key")
 # Written by the backend after it measures the embedding model, not by people.
@@ -89,6 +94,8 @@ class Settings:
 
     llm_provider: str
     chat_model: str
+    # Helper model for the active provider; empty means "use chat_model".
+    fast_model: str
     embed_provider: str
     embed_model: str
     embed_dim: int
@@ -116,13 +123,12 @@ class Settings:
     query_variants: int
     candidates: int
     passages: int
-
-    max_specialists: int
     shortlist: int
-    evidence_limit: int
+    evidence_tokens: int
     use_hypothesis: bool
     enable_review: bool
     enable_suggestions: bool
+    fast_models: dict = field(default_factory=dict)
 
     @property
     def truncating(self) -> bool:
@@ -143,8 +149,9 @@ class Settings:
             "embedder": f"{self.embed_provider}:{self.embed_model}",
             "dimensions": self.embed_dim,
             "pdf_extraction": self.pdf_extraction,
+            "helper": f"{self.llm_provider}:{self.fast_model}" if self.fast_model else None,
             "passages": self.passages,
-            "max_specialists": self.max_specialists,
+            "evidence_tokens": self.evidence_tokens,
             "review": self.enable_review,
         }
 
@@ -202,6 +209,7 @@ def load(overrides: dict | None = None) -> Settings:
 
     llm_provider = pick("llm_provider", "openai").lower()
     models = {p: pick(f"{p}_chat_model", DEFAULT_MODELS[p]) for p in LLM_PROVIDERS}
+    fast_models = {p: pick(f"{p}_fast_model") for p in LLM_PROVIDERS}
     embed_provider = pick("embed_provider", "openai").lower()
     embed_model = pick("embed_model", DEFAULT_EMBED_MODELS.get(embed_provider, ""))
 
@@ -223,6 +231,8 @@ def load(overrides: dict | None = None) -> Settings:
         document_root=Path(_text("DOCUMENT_ROOT", "/data/documents")),
         llm_provider=llm_provider,
         chat_model=models.get(llm_provider, ""),
+        fast_model=fast_models.get(llm_provider, ""),
+        fast_models=fast_models,
         embed_provider=embed_provider,
         embed_model=embed_model,
         embed_dim=embed_dim,
@@ -247,12 +257,12 @@ def load(overrides: dict | None = None) -> Settings:
         child_overlap=_number("CHILD_OVERLAP", 60),
         query_variants=_number("QUERY_VARIANTS", 4),
         candidates=_number("CANDIDATES", 30),
-        passages=_number("PASSAGES", 8),
-        max_specialists=_number("MAX_SPECIALISTS", 4),
-        # Retrieved wide, then narrowed by the model: recall first, precision second.
-        shortlist=_number("SHORTLIST", 24),
-        # How many cited passages the reviewer and final writer see verbatim.
-        evidence_limit=_number("EVIDENCE_LIMIT", 16),
+        # Most passages kept after grading, before widening and merging.
+        passages=_number("PASSAGES", 12),
+        # Retrieved wide, then graded by the model: recall first, precision second.
+        shortlist=_number("SHORTLIST", 30),
+        # Ceiling on the evidence sent to the writer and checker, in tokens.
+        evidence_tokens=_number("EVIDENCE_TOKENS", 7000),
         use_hypothesis=_text("USE_HYPOTHESIS", "true").lower() in ("1", "true", "yes"),
         enable_review=_text("ENABLE_REVIEW", "true").lower() in ("1", "true", "yes"),
         enable_suggestions=_text("ENABLE_SUGGESTIONS", "true").lower()

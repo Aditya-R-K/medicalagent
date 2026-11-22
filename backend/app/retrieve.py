@@ -22,6 +22,28 @@ RRF_CONSTANT = 60
 MAX_TERMS = 12
 
 CITATION = re.compile(r"\[(\d+)\]")
+# Two letters and up: DH, MI, TB and other abbreviations carry the meaning.
+WORD = re.compile(r"[A-Za-z][A-Za-z0-9-]+|\d+[A-Za-z]*")
+
+CHUNK_COLUMNS = """
+    c.id, c.document_id, c.text, c.parent_text, c.section, c.page_start, c.page_end,
+    d.filename, d.year
+"""
+
+
+def any_words_query(text: str) -> str:
+    """A tsquery matching ANY content word, for whole sentences.
+
+    websearch_to_tsquery ANDs every word, so a full question almost never
+    matches; OR-ing the words and ranking by cover density rewards passages
+    that hold many of them close together instead. Stop words are dropped by
+    Postgres itself.
+    """
+    # Hyphenated terms (anti-TNF) are split: a hyphen is tsquery syntax.
+    words = dict.fromkeys(
+        part.lower() for w in WORD.findall(text) for part in w.split("-") if part
+    )
+    return " | ".join(w for w in words if w)[:2000]
 
 
 def vector_literal(values) -> str:
@@ -41,6 +63,7 @@ class Passage:
     year: int | None
     score: float = 0.0
     signals: list[str] = None
+    document_id: int = 0
 
     def __post_init__(self) -> None:
         self.signals = self.signals or []
@@ -69,7 +92,7 @@ class Passage:
             "citation": self.citation,
             "score": round(self.score, 4),
             "signals": self.signals,
-            "excerpt": self.text[:600],
+            "excerpt": self.text[:2000],
         }
 
 
@@ -93,6 +116,7 @@ class Retriever:
         return [row["id"] for row in rows]
 
     def _by_keyword(self, query: str, limit: int) -> list[int]:
+        """Every word must match: right for short index terms like "dapsone dose"."""
         rows = db.query(
             """
             SELECT c.id
@@ -107,6 +131,30 @@ class Retriever:
         )
         return [row["id"] for row in rows]
 
+    def _by_any_word(self, sentence: str, limit: int) -> list[int]:
+        """Any word may match, ranked by how many appear close together: right
+        for whole questions, which an all-words match almost never finds."""
+        expression = any_words_query(sentence)
+        if not expression:
+            return []
+        try:
+            rows = db.query(
+                """
+                SELECT c.id
+                FROM chunks c
+                JOIN documents d ON d.id = c.document_id,
+                     to_tsquery('english', %s) q
+                WHERE d.status = 'indexed' AND c.search @@ q
+                ORDER BY ts_rank_cd(c.search, q) DESC
+                LIMIT %s
+                """,
+                (expression, limit),
+            )
+        except Exception as exc:  # a malformed expression must not sink the search
+            log.info("any-word search skipped: %s", exc)
+            return []
+        return [row["id"] for row in rows]
+
     def search(
         self,
         question: str,
@@ -114,6 +162,7 @@ class Retriever:
         hypothetical: str | None = None,
         terms: list[str] | None = None,
         top_k: int | None = None,
+        exclude: set[int] | None = None,
     ) -> list[Passage]:
         """Search with every angle available.
 
@@ -148,7 +197,7 @@ class Retriever:
 
         for query, vector in zip(queries, vectors):
             absorb("meaning", self._nearest(vector, limit))
-            absorb("keyword", self._by_keyword(query, limit))
+            absorb("keyword", self._by_any_word(query, limit), weight=0.8)
         if hypothetical:
             absorb("hypothesis", self._nearest(vectors[-1], limit), weight=1.2)
 
@@ -156,14 +205,15 @@ class Retriever:
         for term in list(cleaned)[:MAX_TERMS]:
             absorb("term", self._by_keyword(term, limit), weight=0.9)
 
+        for seen in exclude or ():
+            fused.pop(seen, None)
         if not fused:
             return []
 
         best = sorted(fused, key=fused.get, reverse=True)[:top_k]
         rows = db.query(
-            """
-            SELECT c.id, c.text, c.parent_text, c.section, c.page_start, c.page_end,
-                   d.filename, d.year
+            f"""
+            SELECT {CHUNK_COLUMNS}
             FROM chunks c
             JOIN documents d ON d.id = c.document_id
             WHERE c.id = ANY(%s)
@@ -184,33 +234,58 @@ class Retriever:
                 year=row["year"],
                 score=fused[row["id"]] / top,
                 signals=sorted(signals[row["id"]]),
+                document_id=row["document_id"],
             )
             for row in rows
         ]
         passages.sort(key=lambda p: p.score, reverse=True)
         return passages
 
+    def neighbours(self, ids: list[int], radius: int = 1) -> dict[int, Passage]:
+        """The passages either side of each given one, in the same document.
+
+        Passages are stored in reading order, so ids next to each other in one
+        document are consecutive text: expanding a strong hit with its
+        neighbours restores the sentences around it without sending the whole
+        surrounding section.
+        """
+        if not ids:
+            return {}
+        rows = db.query(
+            f"""
+            SELECT DISTINCT {CHUNK_COLUMNS}
+            FROM chunks h
+            JOIN chunks c ON c.document_id = h.document_id
+                         AND c.id BETWEEN h.id - %s AND h.id + %s
+            JOIN documents d ON d.id = c.document_id
+            WHERE h.id = ANY(%s) AND d.status = 'indexed'
+            """,
+            (radius, radius, ids),
+        )
+        return {row["id"]: self._passage(row) for row in rows}
+
+    @staticmethod
+    def _passage(row: dict) -> Passage:
+        return Passage(
+            id=row["id"], text=row["text"], parent_text=row["parent_text"],
+            section=row["section"], page_start=row["page_start"],
+            page_end=row["page_end"], filename=row["filename"], year=row["year"],
+            document_id=row["document_id"],
+        )
+
     def fetch(self, ids: list[int]) -> list[Passage]:
         if not ids:
             return []
         rows = db.query(
-            """
-            SELECT c.id, c.text, c.parent_text, c.section, c.page_start, c.page_end,
-                   d.filename, d.year
+            f"""
+            SELECT {CHUNK_COLUMNS}
             FROM chunks c JOIN documents d ON d.id = c.document_id
             WHERE c.id = ANY(%s)
             """,
             (ids,),
         )
         order = {identifier: position for position, identifier in enumerate(ids)}
-        found = [
-            Passage(
-                id=row["id"], text=row["text"], parent_text=row["parent_text"],
-                section=row["section"], page_start=row["page_start"],
-                page_end=row["page_end"], filename=row["filename"], year=row["year"],
-            )
-            for row in rows
-        ]
+        found = [self._passage(row) for row in rows]
         found.sort(key=lambda p: order.get(p.id, 1_000_000))
         return found
 
@@ -281,12 +356,19 @@ class Sources:
     def __len__(self) -> int:
         return len(self._numbers)
 
+    def passages(self) -> dict[int, Passage]:
+        """Number -> passage, for checking an answer against what it cites."""
+        return {n: self._passages[i] for i, n in self._numbers.items()}
+
     @staticmethod
     def format(numbered: list[tuple[int, Passage]], compact: bool = False) -> str:
         """Compact uses the passage itself; full includes the wider section."""
-        return "\n\n---\n\n".join(
-            f"[{number}] {passage.citation}"
-            + (f" - {passage.section}" if passage.section else "")
-            + f"\n{passage.text if compact else (passage.parent_text or passage.text)}"
+        def attr(value: str) -> str:
+            return value.replace('"', "'")
+
+        return "\n\n".join(
+            f'<source id="{number}" ref="{attr(passage.citation)}"'
+            + (f' section="{attr(passage.section)}"' if passage.section else "")
+            + f">\n{passage.text if compact else (passage.parent_text or passage.text)}\n</source>"
             for number, passage in numbered
         )
