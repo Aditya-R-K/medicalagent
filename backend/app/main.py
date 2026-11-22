@@ -17,7 +17,9 @@ from pydantic import BaseModel, Field
 
 from . import config, db, ingest, store
 from .pipeline import Pipeline
-from .providers import ProviderError, available_models, list_models, probe_embedding
+from .providers import (
+    ProviderError, available_models, list_models, probe_chat, probe_embedding,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -150,6 +152,17 @@ def read_models(kind: str = "chat") -> dict:
     return {"models": available_models(settings, kind)}
 
 
+def _chat_identity(s) -> tuple:
+    """What decides whether the answer model works: provider, models, how it is reached."""
+    reach = {
+        "openai": (s.openai_api_key, s.openai_base_url),
+        "anthropic": (s.anthropic_api_key,),
+        "nvidia": (s.nvidia_api_key, s.nvidia_base_url),
+        "ollama": (s.ollama_host,),
+    }.get(s.llm_provider, ())
+    return (s.llm_provider, s.chat_model, s.fast_model, *reach)
+
+
 def _key_info(key: str, saved: dict) -> dict:
     value = getattr(settings, key) or ""
     return {
@@ -256,6 +269,16 @@ def update_config(body: ConfigUpdate, tasks: BackgroundTasks) -> dict:
         writes["embed_model"] = candidate.embed_model
         writes["embed_dim"] = str(dimensions)
         writes["embed_send_dimensions"] = "true" if shortened else "false"
+
+    # A listed model can still be retired (NVIDIA answers 410 Gone), and a typed
+    # name can be wrong. Try the answer model once before keeping it, so the
+    # student's first question is not where that is discovered.
+    chat_changed = _chat_identity(candidate) != _chat_identity(settings)
+    if chat_changed and not candidate.key_problem(candidate.llm_provider, "answers"):
+        try:
+            probe_chat(candidate)
+        except ProviderError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
     db.write_app_settings(writes)
     apply_saved_settings()

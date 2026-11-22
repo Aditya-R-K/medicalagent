@@ -383,8 +383,11 @@ def _index_one(settings, embedder: EmbeddingModel, record: dict) -> None:
 
         written = 0
         batch = 256
+        refused_before = embedder.rejected
         for start in range(0, len(passages), batch):
             window = passages[start : start + batch]
+            # A passage the provider's content screening refused comes back as
+            # None and is stored without a vector: keyword search still finds it.
             vectors = embedder.embed([p.text for p in window])
             with db.connection() as conn:
                 with conn.cursor() as cursor:
@@ -398,7 +401,8 @@ def _index_one(settings, embedder: EmbeddingModel, record: dict) -> None:
                         [
                             (
                                 document_id, p.text, p.parent_text, p.section,
-                                p.page_start, p.page_end, vector_literal(vector),
+                                p.page_start, p.page_end,
+                                vector_literal(vector) if vector is not None else None,
                             )
                             for p, vector in zip(window, vectors)
                         ],
@@ -409,16 +413,23 @@ def _index_one(settings, embedder: EmbeddingModel, record: dict) -> None:
                 (round(0.5 + written / len(passages) * 0.5, 4), written, document_id),
             )
 
+        refused = embedder.rejected - refused_before
+        note = (
+            f"{refused} of {written} passages were refused by {embedder.name}'s content "
+            "safety screening; they are searchable by keyword only."
+            if refused else None
+        )
         db.execute(
             """
             UPDATE documents
             SET status = 'indexed', progress = 1, chunk_count = %s, pages = %s,
-                year = %s, indexed_at = now(), error = NULL
+                year = %s, indexed_at = now(), error = %s
             WHERE id = %s
             """,
-            (written, parsed.pages, parsed.year, document_id),
+            (written, parsed.pages, parsed.year, note, document_id),
         )
-        log.info("%s: indexed %d passages", record["filename"], written)
+        log.info("%s: indexed %d passages%s", record["filename"], written,
+                 f" ({refused} refused by content screening)" if refused else "")
 
     except Exception as exc:
         log.exception("failed to index %s", record["filename"])

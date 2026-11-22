@@ -92,6 +92,50 @@ def _retryable(exc: Exception) -> bool:
     )
 
 
+class SafetyRejection(ProviderError):
+    """The provider's content screening refused the request.
+
+    NVIDIA's hosted API screens inputs and answers 422 "input rejected by
+    content safety screening"; medical text (doses, overdose, self-harm,
+    sexual health) can trip it. Retrying the same text never helps, so this is
+    told apart from ordinary failures and handled where it happens.
+    """
+
+
+class ModelUnavailable(ProviderError):
+    """The provider has no such model: retired (410 Gone) or never existed (404).
+
+    NVIDIA retires hosted models and answers 410 for them; its model list can
+    still name them for a while. Retrying never helps.
+    """
+
+
+def is_model_unavailable(exc: Exception) -> bool:
+    if isinstance(exc, ModelUnavailable):
+        return True
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    text = str(exc).lower()
+    if status == 410 or ("410" in text and ("gone" in text or "error code" in text)):
+        return True
+    return (status == 404 or "404" in text) and any(
+        m in text for m in ("model", "not found", "does not exist", "no such"))
+
+
+def _unavailable_message(name: str) -> str:
+    return (
+        f"{name} is not available: the provider says this model has been retired "
+        "or does not exist. Open Settings → Models, press Refresh, and pick a "
+        "current model."
+    )
+
+
+def is_safety_rejection(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return isinstance(exc, SafetyRejection) or (
+        "safety" in text and any(m in text for m in ("422", "reject", "screen", "blocked"))
+    )
+
+
 def _with_retries(operation, attempts: int, label: str):
     last: Exception | None = None
     for attempt in range(attempts):
@@ -101,10 +145,23 @@ def _with_retries(operation, attempts: int, label: str):
             raise
         except Exception as exc:
             last = exc
+            if is_safety_rejection(exc):
+                raise SafetyRejection(f"{label}: {exc}") from exc
+            if is_model_unavailable(exc):
+                raise ModelUnavailable(f"{label}: {exc}") from exc
             if not _retryable(exc) or attempt == attempts - 1:
                 break
             time.sleep(2**attempt)
     raise ProviderError(f"{label}: {last}")
+
+
+def _safety_message(name: str) -> str:
+    return (
+        f"{name} refused this request: the provider's content safety screening "
+        "rejected it. Medical material often trips NVIDIA's screening. Choose a "
+        "different answer model in Settings (another NVIDIA model, or another "
+        "provider) and ask again."
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -343,7 +400,12 @@ class ChatModel:
             )
             return response["message"]["content"]
 
-        return _with_retries(call, 4, f"{self.name} request failed").strip()
+        try:
+            return _with_retries(call, 4, f"{self.name} request failed").strip()
+        except SafetyRejection as exc:
+            raise SafetyRejection(_safety_message(self.name)) from exc
+        except ModelUnavailable as exc:
+            raise ModelUnavailable(_unavailable_message(self.name)) from exc
 
     def stream(self, system: str, user: str, history: list[dict] | None = None,
                context: str | None = None, effort: str | None = None) -> Iterator[str]:
@@ -377,20 +439,50 @@ class ChatModel:
         except ProviderError:
             raise
         except Exception as exc:
+            if is_safety_rejection(exc):
+                raise SafetyRejection(_safety_message(self.name)) from exc
+            if is_model_unavailable(exc):
+                raise ModelUnavailable(_unavailable_message(self.name)) from exc
             raise ProviderError(f"{self.name} stream failed: {exc}") from exc
 
     def structured(self, system: str, user: str, fallback: dict,
                    context: str | None = None) -> tuple[dict, bool]:
-        """Ask for JSON, falling back rather than failing when it cannot be parsed."""
-        reply = self.complete(
-            f"{system}\n\nReply with a single JSON object and nothing else.", user,
-            json_only=True, context=context, effort="low",
-        )
+        """Ask for JSON, falling back rather than failing when it cannot be parsed.
+
+        A safety refusal also falls back: planning, grading and checking all
+        have a sensible default, and one refused helper call must not cost the
+        student the whole answer.
+        """
+        try:
+            reply = self.complete(
+                f"{system}\n\nReply with a single JSON object and nothing else.", user,
+                json_only=True, context=context, effort="low",
+            )
+        except SafetyRejection:
+            log.warning("%s: helper call refused by content screening; using fallback",
+                        self.name)
+            return dict(fallback), False
         parsed = parse_json(reply)
         if parsed is None:
             log.info("%s returned unparseable JSON; using fallback", self.name)
             return dict(fallback), False
         return parsed, True
+
+
+def probe_chat(settings) -> None:
+    """Send the answer model (and helper, if set) one tiny message.
+
+    A model can be listed by its provider and still be retired, or be a typed
+    name with a typo; finding out on Save is far better than on the student's
+    first question. A content-screening refusal of the word "ping" would be
+    odd, but it would not mean the model is unusable, so it passes.
+    """
+    for fast in ((False, True) if settings.fast_model else (False,)):
+        model = ChatModel(settings, fast=fast)
+        try:
+            model.complete("Reply with the single word OK.", "ping", effort="low")
+        except SafetyRejection:
+            continue
 
 
 def _log_usage(name: str, usage) -> None:
@@ -433,16 +525,44 @@ class EmbeddingModel:
         self.name = f"{self.provider}:{self.model}"
         self.batch_size = 64 if self.provider == "nvidia" else 128
         self.max_tokens = 8000
+        # Passages the provider's content screening refused while indexing.
+        self.rejected = 0
         self._client = _embed_client(settings)
 
-    def embed(self, texts: Sequence[str], kind: str = "passage") -> list[list[float]]:
+    def embed(self, texts: Sequence[str], kind: str = "passage") -> list[list[float] | None]:
         """`kind` is "passage" for indexed text and "query" for questions; NVIDIA's
-        retrieval models embed the two differently."""
-        vectors: list[list[float]] = []
+        retrieval models embed the two differently.
+
+        For passages, a vector is None where the provider's content screening
+        refused that passage: the rest of the document still gets indexed.
+        """
+        vectors: list[list[float] | None] = []
         for start in range(0, len(texts), self.batch_size):
             batch = [truncate(t, self.max_tokens) for t in texts[start : start + self.batch_size]]
-            vectors.extend(self._encode(batch, kind))
+            if kind == "passage":
+                vectors.extend(self._encode_screened(batch, kind))
+            else:
+                vectors.extend(self._encode(batch, kind))
         return vectors
+
+    def _encode_screened(self, batch: list[str], kind: str) -> list[list[float] | None]:
+        """Encode, isolating any passage the content screening refuses.
+
+        One refused passage fails its whole batch, so the batch is halved until
+        the refused passage is alone - a few extra requests, instead of losing
+        a document over one paragraph about overdose management.
+        """
+        try:
+            return self._encode(batch, kind)
+        except SafetyRejection:
+            if len(batch) == 1:
+                self.rejected += 1
+                log.warning("%s refused a passage (content screening): %.80s...",
+                            self.name, batch[0].replace("\n", " "))
+                return [None]
+            middle = len(batch) // 2
+            return (self._encode_screened(batch[:middle], kind)
+                    + self._encode_screened(batch[middle:], kind))
 
     def embed_one(self, text: str, kind: str = "query") -> list[float]:
         return self._encode([truncate(text, self.max_tokens)], kind)[0]

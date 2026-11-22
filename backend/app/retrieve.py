@@ -14,7 +14,7 @@ import threading
 from dataclasses import dataclass
 
 from . import db
-from .providers import EmbeddingModel
+from .providers import EmbeddingModel, is_safety_rejection
 
 log = logging.getLogger(__name__)
 
@@ -107,7 +107,7 @@ class Retriever:
             SELECT c.id
             FROM chunks c
             JOIN documents d ON d.id = c.document_id
-            WHERE d.status = 'indexed'
+            WHERE d.status = 'indexed' AND c.embedding IS NOT NULL
             ORDER BY c.embedding <=> %s::vector
             LIMIT %s
             """,
@@ -193,12 +193,22 @@ class Retriever:
         # One embeddings request for every query at once, instead of a round
         # trip per variant.
         texts = queries + ([hypothetical] if hypothetical else [])
-        vectors = self.embedder.embed(texts, kind="query")
+        try:
+            vectors = self.embedder.embed(texts, kind="query")
+        except Exception as exc:
+            if not is_safety_rejection(exc):
+                raise
+            # The provider's content screening refused the question itself.
+            # Keyword search needs no provider, so the student still gets an
+            # answer from the documents.
+            log.warning("query embedding refused by content screening; keyword search only")
+            vectors = []
 
-        for query, vector in zip(queries, vectors):
-            absorb("meaning", self._nearest(vector, limit))
+        for position, query in enumerate(queries):
+            if vectors:
+                absorb("meaning", self._nearest(vectors[position], limit))
             absorb("keyword", self._by_any_word(query, limit), weight=0.8)
-        if hypothetical:
+        if hypothetical and vectors:
             absorb("hypothesis", self._nearest(vectors[-1], limit), weight=1.2)
 
         cleaned = dict.fromkeys(t.strip() for t in (terms or []) if t and t.strip())
