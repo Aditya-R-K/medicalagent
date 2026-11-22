@@ -449,17 +449,31 @@ async function uploadFiles(files) {
 /* -------------------------------------------------------------- settings */
 
 const PROVIDERS = {
-  openai: { label: 'OpenAI', hasKey: true },
-  nvidia: { label: 'NVIDIA', hasKey: true },
-  ollama: { label: 'Ollama', hasKey: false },
+  openai: { label: 'OpenAI', key: true },
+  anthropic: { label: 'Claude', key: true },
+  nvidia: { label: 'NVIDIA NIM', key: true },
+  ollama: { label: 'Ollama', key: false },
+};
+const DEFAULT_EMBED = {
+  openai: 'text-embedding-3-large',
+  nvidia: 'nvidia/llama-3.2-nv-embedqa-1b-v2',
+  ollama: 'nomic-embed-text',
 };
 const CUSTOM = '__custom__';
+const label = (p) => PROVIDERS[p]?.label || p;
 
 const settingsUi = {
-  config: null,   // last GET /config
-  tab: 'openai',  // provider shown, and the one that will write answers on save
-  models: {},     // provider -> list fetched from it
-  loading: {},    // provider -> in-flight request
+  config: null,
+  chatProvider: 'openai',
+  embedProvider: 'openai',
+  lists: { chat: {}, embedding: {} },    // kind -> provider -> models
+  choice: { chat: {}, embedding: {} },   // kind -> provider -> model picked this session
+  loading: {},
+};
+
+const KIND = {
+  chat: { select: 'chat-model', custom: 'chat-model-custom', refresh: 'chat-refresh' },
+  embedding: { select: 'embed-model', custom: 'embed-model-custom', refresh: 'embed-refresh' },
 };
 
 function setSettingsMessage(text, kind = '') {
@@ -468,143 +482,286 @@ function setSettingsMessage(text, kind = '') {
   el.className = `settings-message${kind ? ` ${kind}` : ''}`;
 }
 
-/* Fill a provider's model dropdown, keeping `selected` available even when
-   the provider did not list it (a typed name, or a list not loaded yet). */
-function fillModelSelect(provider, list, selected) {
-  const select = $(`${provider}-model`);
-  const custom = $(`${provider}-model-custom`);
+function showSettingsTab(tab) {
+  document.querySelectorAll('.settings-tabs button').forEach((b) =>
+    b.setAttribute('aria-selected', String(b.dataset.tab === tab)));
+  document.querySelectorAll('.tab-pane').forEach((pane) => {
+    pane.hidden = pane.dataset.pane !== tab;
+  });
+}
+
+/* ------------------------------------------------------------ model lists */
+
+function fillModels(kind, list, selected) {
+  const { select: sid, custom: cid } = KIND[kind];
+  const select = $(sid);
   const names = [...new Set(list || [])];
   if (selected && !names.includes(selected)) names.unshift(selected);
   select.innerHTML =
     names.map((n) => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`).join('') +
     `<option value="${CUSTOM}">Other (type a name)…</option>`;
-  select.value = names[0] === undefined ? CUSTOM : (selected || names[0]);
-  custom.hidden = select.value !== CUSTOM;
+  select.value = names.length ? (selected || names[0]) : CUSTOM;
+  $(cid).hidden = select.value !== CUSTOM;
 }
 
-function chosenModel(provider) {
-  const select = $(`${provider}-model`);
-  return select.value === CUSTOM
-    ? $(`${provider}-model-custom`).value.trim()
-    : select.value;
+function chosen(kind) {
+  const { select, custom } = KIND[kind];
+  return $(select).value === CUSTOM ? $(custom).value.trim() : $(select).value;
 }
 
-function showTab(provider) {
-  settingsUi.tab = provider;
-  document.querySelectorAll('#provider-tabs button').forEach((b) => {
-    b.setAttribute('aria-selected', String(b.dataset.provider === provider));
-  });
-  document.querySelectorAll('.provider-pane').forEach((pane) => {
-    pane.hidden = pane.dataset.pane !== provider;
-  });
-  const active = settingsUi.config?.llm_provider;
-  $('provider-active-note').textContent = active === provider
-    ? `${PROVIDERS[provider].label} is writing the answers now.`
-    : `Answers are written by ${PROVIDERS[active]?.label || active} now. ` +
-      `Save to switch to ${PROVIDERS[provider].label}.`;
-  setSettingsMessage('');
-  // Fetch the list the first time a tab is shown, when it can succeed.
-  const info = settingsUi.config?.providers?.[provider];
-  const canList = !PROVIDERS[provider].hasKey || info?.key_set ||
-    $(`${provider}-key`)?.value.trim();
-  if (!settingsUi.models[provider] && canList) loadProviderModels(provider, { quiet: true });
+function currentProvider(kind) {
+  return kind === 'chat' ? settingsUi.chatProvider : settingsUi.embedProvider;
 }
 
-function trialBody(provider) {
-  const body = { provider };
+/* Values typed in the API keys tab, so a key can be tried before saving. */
+function trialBody(provider, kind) {
+  const body = { provider, kind };
   if (provider === 'ollama') {
     body.host = $('ollama-host').value.trim();
   } else {
     body.api_key = $(`${provider}-key`).value.trim();
-    body.base_url = $(`${provider}-base`).value.trim();
+    if (provider === 'openai') body.base_url = $('openai-base').value.trim();
+    if (provider === 'nvidia') {
+      body.base_url = kind === 'embedding'
+        ? ($('nvidia-embed-base').value.trim() || $('nvidia-base').value.trim())
+        : $('nvidia-base').value.trim();
+    }
   }
   return body;
 }
 
-function loadProviderModels(provider, { quiet = false } = {}) {
-  if (settingsUi.loading[provider]) return settingsUi.loading[provider];
-  const button = document.querySelector(`[data-load="${provider}"]`);
+function canReach(provider, kind = 'chat') {
+  if (!PROVIDERS[provider].key) return true;
+  if ($(`${provider}-key`).value.trim()) return true;
+  if (settingsUi.config?.providers?.[provider]?.key_set) return true;
+  if (provider === 'nvidia') {
+    const url = kind === 'embedding'
+      ? ($('nvidia-embed-base').value || $('nvidia-base').value)
+      : $('nvidia-base').value;
+    return Boolean(url.trim()) && !url.includes('api.nvidia.com');
+  }
+  return false;
+}
+
+async function fetchModels(provider, kind) {
+  const id = `${kind}:${provider}`;
+  if (!settingsUi.loading[id]) {
+    settingsUi.loading[id] = api.post('/config/models', trialBody(provider, kind))
+      .then(({ models }) => {
+        settingsUi.lists[kind][provider] = models;
+        return models;
+      })
+      .finally(() => { settingsUi.loading[id] = null; });
+  }
+  return settingsUi.loading[id];
+}
+
+async function refreshModels(kind, { quiet = false } = {}) {
+  const provider = currentProvider(kind);
+  const button = $(KIND[kind].refresh);
   button.disabled = true;
   button.textContent = 'Loading…';
-  const request = api.post('/config/models', trialBody(provider))
-    .then(({ models }) => {
-      settingsUi.models[provider] = models;
-      fillModelSelect(provider, models, chosenModel(provider));
-      if (!quiet) {
-        setSettingsMessage(
-          `Connected to ${PROVIDERS[provider].label}: ${models.length} model${models.length === 1 ? '' : 's'} available.`,
-          'ok');
-      }
-    })
-    .catch((error) => {
-      if (settingsUi.tab === provider) setSettingsMessage(error.message, 'bad');
-    })
-    .finally(() => {
-      settingsUi.loading[provider] = null;
-      button.disabled = false;
-      button.textContent = 'Refresh list';
-    });
-  settingsUi.loading[provider] = request;
-  return request;
-}
-
-function renderKeyStatus(provider, info) {
-  const tag = document.querySelector(`[data-source-for="${provider}"]`);
-  const input = $(`${provider}-key`);
-  input.value = '';
-  input.type = 'password';
-  document.querySelector(`[data-reveal="${provider}-key"]`).textContent = 'Show';
-  input.placeholder = info.key_set
-    ? `${info.key_hint}  (leave blank to keep)`
-    : (provider === 'nvidia' ? 'nvapi-…' : 'sk-…');
-  tag.className = `source-tag ${info.key_source}`;
-  tag.textContent = info.key_source === 'saved' ? 'saved'
-    : info.key_source === 'env' ? 'from .env' : '';
-  tag.parentElement.querySelector('.remove-key')?.remove();
-  if (info.key_source !== 'saved') return;
-
-  const remove = document.createElement('button');
-  remove.type = 'button';
-  remove.className = 'remove-key';
-  remove.textContent = 'Remove';
-  remove.onclick = async (event) => {
-    event.preventDefault();
-    if (!confirm(`Remove the saved ${PROVIDERS[provider].label} key? ` +
-      'The one in .env, if any, will be used instead.')) return;
-    try {
-      renderSettings(await api.put('/config', { [`${provider}_api_key`]: '' }));
-      settingsUi.models[provider] = null;
-      setSettingsMessage('Key removed.', 'ok');
-      loadSettings();
-    } catch (error) {
-      setSettingsMessage(error.message, 'bad');
+  try {
+    const models = await fetchModels(provider, kind);
+    if (currentProvider(kind) !== provider) return;
+    fillModels(kind, models, chosen(kind));
+    if (!quiet) {
+      setSettingsMessage(`${label(provider)}: ${models.length} ${kind === 'embedding' ? 'embedding ' : ''}model${models.length === 1 ? '' : 's'} available.`, 'ok');
     }
-  };
-  tag.after(remove);
+    if (kind === 'embedding' && !models.length) {
+      setSettingsMessage(`${label(provider)} listed no embedding models. Type one with "Other…".`, 'bad');
+    }
+  } catch (error) {
+    if (currentProvider(kind) === provider) setSettingsMessage(error.message, 'bad');
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Refresh';
+  }
 }
 
-function renderSettings(config) {
-  settingsUi.config = config;
-  const { providers } = config;
-  ['openai', 'nvidia'].forEach((p) => {
-    renderKeyStatus(p, providers[p]);
-    $(`${p}-base`).value = providers[p].base_url || '';
+/* -------------------------------------------------------------- providers */
+
+function selectProvider(kind, provider) {
+  const previous = currentProvider(kind);
+  if (previous) settingsUi.choice[kind][previous] = chosen(kind);
+  if (kind === 'chat') settingsUi.chatProvider = provider;
+  else settingsUi.embedProvider = provider;
+
+  const group = kind === 'chat' ? 'chat-providers' : 'embed-providers';
+  document.querySelectorAll(`#${group} button`).forEach((b) =>
+    b.setAttribute('aria-checked', String(b.dataset.provider === provider)));
+
+  const config = settingsUi.config;
+  const saved = kind === 'chat'
+    ? config.providers[provider]?.model
+    : (config.embedding.provider === provider ? config.embedding.model : DEFAULT_EMBED[provider]);
+  fillModels(kind, settingsUi.lists[kind][provider], settingsUi.choice[kind][provider] || saved);
+
+  if (kind === 'chat') renderChatNote();
+  else renderEmbedWarning();
+
+  if (!canReach(provider, kind)) {
+    setSettingsMessage(`Add your ${label(provider)} key in the API keys tab to list its models.`, 'bad');
+  } else {
+    setSettingsMessage('');
+    if (!settingsUi.lists[kind][provider]) refreshModels(kind, { quiet: true });
+  }
+}
+
+function renderChatNote() {
+  const active = settingsUi.config.llm_provider;
+  const p = settingsUi.chatProvider;
+  $('chat-note').textContent = active === p
+    ? `${label(p)} is writing the answers now.`
+    : `Answers come from ${label(active)} now. Save to switch to ${label(p)}.`;
+}
+
+function embeddingChanged() {
+  const e = settingsUi.config.embedding;
+  return settingsUi.embedProvider !== e.provider || chosen('embedding') !== e.model;
+}
+
+function renderEmbedWarning() {
+  const warn = $('embed-warning');
+  const { index } = settingsUi.config;
+  if (!embeddingChanged() || !chosen('embedding')) {
+    warn.hidden = true;
+    return;
+  }
+  const n = index.documents_total;
+  warn.hidden = false;
+  warn.textContent = n
+    ? `Saving rebuilds the index: ${n} document${n === 1 ? '' : 's'} will be re-embedded with ` +
+      `${label(settingsUi.embedProvider)} · ${chosen('embedding')}. Questions can't be answered until it finishes.`
+    : `The index will be built with ${label(settingsUi.embedProvider)} · ${chosen('embedding')}.`;
+}
+
+function renderIndexCard() {
+  const { embedding, index } = settingsUi.config;
+  const state = index.indexing
+    ? '<span class="pill indexing">indexing</span>'
+    : index.documents_total && index.documents_indexed < index.documents_total
+      ? '<span class="pill pending">needs indexing</span>'
+      : '<span class="pill indexed">ready</span>';
+  $('index-card').innerHTML = `
+    <div class="index-top"><strong>Current index</strong>${state}</div>
+    <div class="index-meta">
+      ${escapeHtml(label(embedding.provider))} · ${escapeHtml(embedding.model)} ·
+      ${embedding.dimensions} dimensions${embedding.shortened ? ' (shortened)' : ''}
+      ${embedding.vector_index ? '' : ' · exact search (too wide for the vector index)'}
+    </div>
+    <div class="index-meta">
+      ${index.documents_indexed}/${index.documents_total} documents ·
+      ${Number(index.passages).toLocaleString()} passages
+    </div>`;
+}
+
+/* ------------------------------------------------------------------- keys */
+
+function renderKeys(config) {
+  ['openai', 'anthropic', 'nvidia'].forEach((provider) => {
+    const info = config.providers[provider];
+    const input = $(`${provider}-key`);
+    input.value = '';
+    input.type = 'password';
+    document.querySelector(`[data-reveal="${provider}-key"]`).textContent = 'Show';
+    input.placeholder = info.key_set
+      ? `${info.key_hint}  (saved, leave blank to keep)`
+      : { openai: 'sk-…', anthropic: 'sk-ant-…', nvidia: 'nvapi-…' }[provider];
+
+    const tag = document.querySelector(`[data-source-for="${provider}"]`);
+    tag.className = `source-tag ${info.key_source}`;
+    tag.textContent = info.key_source === 'saved' ? 'saved'
+      : info.key_source === 'env' ? 'from environment' : 'not set';
+
+    tag.parentElement.querySelector('.remove-key')?.remove();
+    if (info.key_source === 'saved') {
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'remove-key';
+      remove.textContent = 'Remove';
+      remove.onclick = () => removeKey(provider);
+      tag.after(remove);
+    }
   });
-  $('ollama-host').value = providers.ollama.host || '';
-  Object.keys(PROVIDERS).forEach((p) =>
-    fillModelSelect(p, settingsUi.models[p], providers[p].model));
-  document.querySelectorAll('#provider-tabs button').forEach((b) =>
-    b.classList.toggle('active-provider', b.dataset.provider === config.llm_provider));
+  $('openai-base').value = config.providers.openai.base_url || '';
+  $('nvidia-base').value = config.providers.nvidia.base_url || '';
+  const embedBase = config.providers.nvidia.embed_base_url || '';
+  $('nvidia-embed-base').value = embedBase === config.providers.nvidia.base_url ? '' : embedBase;
+  $('ollama-host').value = config.providers.ollama.host || '';
+  document.querySelectorAll('.key-status').forEach((el) => { el.textContent = ''; el.className = 'key-status'; });
 }
 
-async function openSettings() {
+async function removeKey(provider) {
+  if (!confirm(`Remove the saved ${label(provider)} key?`)) return;
+  try {
+    const config = await api.put('/config', { [`${provider}_api_key`]: '' });
+    settingsUi.lists.chat[provider] = null;
+    settingsUi.lists.embedding[provider] = null;
+    applyConfig(config, { keepSelection: true });
+    setSettingsMessage(`${label(provider)} key removed.`, 'ok');
+    loadSettings();
+  } catch (error) {
+    setSettingsMessage(error.message, 'bad');
+  }
+}
+
+async function testProvider(provider) {
+  const status = document.querySelector(`[data-status-for="${provider}"]`);
+  const button = document.querySelector(`[data-test="${provider}"]`);
+  if (!canReach(provider)) {
+    status.className = 'key-status bad';
+    status.textContent = 'Enter a key first.';
+    return;
+  }
+  button.disabled = true;
+  status.className = 'key-status';
+  status.textContent = 'Connecting…';
+  settingsUi.lists.chat[provider] = null;
+  try {
+    const models = await fetchModels(provider, 'chat');
+    status.className = 'key-status ok';
+    status.textContent = `✓ Connected · ${models.length} model${models.length === 1 ? '' : 's'} available`;
+  } catch (error) {
+    status.className = 'key-status bad';
+    status.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+/* ------------------------------------------------------------ open & save */
+
+function applyConfig(config, { keepSelection = false } = {}) {
+  settingsUi.config = config;
+  renderKeys(config);
+  renderIndexCard();
+  document.querySelectorAll('#chat-providers button').forEach((b) =>
+    b.classList.toggle('active-provider', b.dataset.provider === config.llm_provider));
+  document.querySelectorAll('#embed-providers button').forEach((b) =>
+    b.classList.toggle('active-provider', b.dataset.provider === config.embedding.provider));
+  if (!keepSelection) {
+    settingsUi.choice = { chat: {}, embedding: {} };
+    settingsUi.chatProvider = null;
+    settingsUi.embedProvider = null;
+    selectProvider('chat', config.llm_provider in PROVIDERS ? config.llm_provider : 'openai');
+    selectProvider('embedding', config.embedding.provider);
+  } else {
+    renderChatNote();
+    renderEmbedWarning();
+  }
+}
+
+async function openSettings(tab) {
   $('settings-panel').hidden = false;
   setSettingsMessage('Loading…');
   try {
     const config = await api.get('/config');
-    renderSettings(config);
-    showTab(config.llm_provider in PROVIDERS ? config.llm_provider : 'openai');
-    if (config.problems?.length) setSettingsMessage(config.problems[0], 'bad');
+    applyConfig(config);
+    const noKeys = ['openai', 'anthropic', 'nvidia'].every((p) => !config.providers[p].key_set);
+    showSettingsTab(typeof tab === 'string' ? tab : (noKeys ? 'keys' : 'models'));
+    if (noKeys) setSettingsMessage('Start by adding an API key for at least one provider.');
+    else if (config.problems?.length) setSettingsMessage(config.problems[0], 'bad');
   } catch (error) {
     setSettingsMessage(`Could not load settings: ${error.message}`, 'bad');
   }
@@ -615,45 +772,64 @@ function closeSettings() {
 }
 
 async function saveSettings() {
-  const provider = settingsUi.tab;
-  const model = chosenModel(provider);
-  if (!model) {
-    setSettingsMessage('Choose a model, or type its name.', 'bad');
+  const chatProvider = settingsUi.chatProvider;
+  const chatModel = chosen('chat');
+  const embedModel = chosen('embedding');
+  if (!chatModel || !embedModel) {
+    showSettingsTab('models');
+    setSettingsMessage('Choose a model for answers and for search, or type its name.', 'bad');
     return;
   }
-  const body = { llm_provider: provider };
-  Object.keys(PROVIDERS).forEach((p) => {
-    const m = chosenModel(p);
-    if (m) body[`${p}_chat_model`] = m;
-  });
-  ['openai', 'nvidia'].forEach((p) => {
+
+  const body = {
+    llm_provider: chatProvider,
+    [`${chatProvider}_chat_model`]: chatModel,
+    embed_provider: settingsUi.embedProvider,
+    embed_model: embedModel,
+    openai_base_url: $('openai-base').value.trim(),
+    nvidia_base_url: $('nvidia-base').value.trim(),
+    nvidia_embed_base_url: $('nvidia-embed-base').value.trim(),
+    ollama_host: $('ollama-host').value.trim(),
+  };
+  ['openai', 'anthropic', 'nvidia'].forEach((p) => {
     const key = $(`${p}-key`).value.trim();
     if (key) body[`${p}_api_key`] = key; // blank keeps the current key
-    body[`${p}_base_url`] = $(`${p}-base`).value.trim();
   });
-  body.ollama_host = $('ollama-host').value.trim();
 
-  if (PROVIDERS[provider].hasKey && !body[`${provider}_api_key`] &&
-      !settingsUi.config?.providers[provider].key_set) {
-    setSettingsMessage(`Add your ${PROVIDERS[provider].label} API key first.`, 'bad');
-    $(`${provider}-key`).focus();
-    return;
+  for (const [provider, purpose, kind] of [
+    [chatProvider, 'answers', 'chat'], [settingsUi.embedProvider, 'search', 'embedding']]) {
+    if (!canReach(provider, kind)) {
+      showSettingsTab('keys');
+      setSettingsMessage(`${label(provider)} is selected for ${purpose}. Add its API key first.`, 'bad');
+      $(`${provider}-key`)?.focus();
+      return;
+    }
   }
+
+  const rebuild = embeddingChanged();
+  if (rebuild && settingsUi.config.index.documents_total && !confirm(
+    `Switch search to ${label(settingsUi.embedProvider)} · ${embedModel}?\n\n` +
+    `The current index will be cleared and all ${settingsUi.config.index.documents_total} ` +
+    'documents re-embedded with the new model. This can take a while and uses the ' +
+    'provider\'s API.')) return;
 
   const button = $('save-settings');
   button.disabled = true;
-  button.textContent = 'Saving…';
+  button.textContent = rebuild ? 'Checking model…' : 'Saving…';
   try {
-    const config = await api.put('/config', body);
-    renderSettings(config);
-    showTab(provider);
-    await loadSettings();
-    if (config.problems?.length) {
-      setSettingsMessage(`Saved, but: ${config.problems[0]}`, 'bad');
-    } else {
+    const result = await api.put('/config', body);
+    applyConfig(result);
+    loadSettings();
+    if (result.reindexing) {
       setSettingsMessage(
-        `Saved. Answers will now come from ${PROVIDERS[provider].label} · ${model}.`, 'ok');
-      setTimeout(() => { if (!$('settings-panel').hidden) closeSettings(); }, 900);
+        `Saved. Re-indexing with ${label(result.embedding.provider)} · ${result.embedding.model} ` +
+        `(${result.embedding.dimensions} dimensions); follow progress in Documents.`, 'ok');
+      loadDocuments();
+    } else if (result.problems?.length) {
+      setSettingsMessage(`Saved, but: ${result.problems[0]}`, 'bad');
+    } else {
+      setSettingsMessage(`Saved. Answers: ${label(chatProvider)} · ${chatModel}.`, 'ok');
+      setTimeout(() => { if (!$('settings-panel').hidden) closeSettings(); }, 1000);
     }
   } catch (error) {
     setSettingsMessage(error.message, 'bad');
@@ -665,7 +841,7 @@ async function saveSettings() {
 
 function wireSettings() {
   ['open-settings', 'open-settings-side', 'model-chip', 'model-line'].forEach((id) => {
-    $(id).onclick = openSettings;
+    $(id).onclick = () => openSettings();
   });
   $('close-settings').onclick = closeSettings;
   $('cancel-settings').onclick = closeSettings;
@@ -673,32 +849,51 @@ function wireSettings() {
     if (event.target === $('settings-panel')) closeSettings();
   };
   $('save-settings').onclick = saveSettings;
-  $('test-provider').onclick = () => loadProviderModels(settingsUi.tab);
 
-  document.querySelectorAll('#provider-tabs button').forEach((b) => {
-    b.onclick = () => showTab(b.dataset.provider);
+  document.querySelectorAll('.settings-tabs button').forEach((b) => {
+    b.onclick = () => showSettingsTab(b.dataset.tab);
   });
-  document.querySelectorAll('[data-load]').forEach((b) => {
-    b.onclick = () => loadProviderModels(b.dataset.load);
+  document.querySelectorAll('#chat-providers button').forEach((b) => {
+    b.onclick = () => selectProvider('chat', b.dataset.provider);
+  });
+  document.querySelectorAll('#embed-providers button').forEach((b) => {
+    b.onclick = () => selectProvider('embedding', b.dataset.provider);
+  });
+  $('chat-refresh').onclick = () => {
+    settingsUi.lists.chat[settingsUi.chatProvider] = null;
+    refreshModels('chat');
+  };
+  $('embed-refresh').onclick = () => {
+    settingsUi.lists.embedding[settingsUi.embedProvider] = null;
+    refreshModels('embedding');
+  };
+  Object.entries(KIND).forEach(([kind, ids]) => {
+    $(ids.select).onchange = () => {
+      const custom = $(ids.custom);
+      custom.hidden = $(ids.select).value !== CUSTOM;
+      if (!custom.hidden) custom.focus();
+      if (kind === 'embedding') renderEmbedWarning();
+    };
+    $(ids.custom).oninput = () => { if (kind === 'embedding') renderEmbedWarning(); };
+  });
+  document.querySelectorAll('[data-test]').forEach((b) => {
+    b.onclick = () => testProvider(b.dataset.test);
   });
   document.querySelectorAll('[data-reveal]').forEach((b) => {
-    b.onclick = (event) => {
-      event.preventDefault();
+    b.onclick = () => {
       const input = $(b.dataset.reveal);
       input.type = input.type === 'password' ? 'text' : 'password';
       b.textContent = input.type === 'password' ? 'Show' : 'Hide';
     };
   });
-  Object.keys(PROVIDERS).forEach((p) => {
-    $(`${p}-model`).onchange = (event) => {
-      const custom = $(`${p}-model-custom`);
-      custom.hidden = event.target.value !== CUSTOM;
-      if (!custom.hidden) custom.focus();
-    };
-  });
-  // A newly typed key makes the cached list stale.
-  ['openai', 'nvidia'].forEach((p) => {
-    $(`${p}-key`).addEventListener('change', () => { settingsUi.models[p] = null; });
+  // A newly typed key or address makes cached model lists stale.
+  ['openai-key', 'anthropic-key', 'nvidia-key', 'openai-base', 'nvidia-base',
+    'nvidia-embed-base', 'ollama-host'].forEach((id) => {
+    $(id).addEventListener('change', () => {
+      const provider = id.split('-')[0];
+      settingsUi.lists.chat[provider] = null;
+      settingsUi.lists.embedding[provider] = null;
+    });
   });
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape' && !$('settings-panel').hidden) closeSettings();
@@ -710,7 +905,7 @@ function showModelChip(llm) {
   if (!llm) { chip.hidden = true; return; }
   const [provider, ...rest] = llm.split(':');
   chip.innerHTML =
-    `<span class="prov">${escapeHtml(PROVIDERS[provider]?.label || provider)}</span>` +
+    `<span class="prov">${escapeHtml(label(provider))}</span>` +
     `<span>${escapeHtml(rest.join(':'))}</span>`;
   chip.hidden = false;
 }

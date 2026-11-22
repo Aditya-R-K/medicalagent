@@ -24,6 +24,8 @@ services:
 
   backend:
     build: ./backend
+    # Every variable below is optional. Keys, providers and models are set in the
+    # interface (gear icon) and stored in the database; these only act as defaults.
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-aidoctor}:${POSTGRES_PASSWORD:-aidoctor}@db:5432/${POSTGRES_DB:-aidoctor}
       LLM_PROVIDER: ${LLM_PROVIDER:-openai}
@@ -34,6 +36,11 @@ services:
       NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
       NVIDIA_BASE_URL: ${NVIDIA_BASE_URL:-}
       NVIDIA_CHAT_MODEL: ${NVIDIA_CHAT_MODEL:-meta/llama-3.3-70b-instruct}
+      NVIDIA_EMBED_BASE_URL: ${NVIDIA_EMBED_BASE_URL:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_CHAT_MODEL: ${ANTHROPIC_CHAT_MODEL:-claude-opus-5-5}
+      EMBED_PROVIDER: ${EMBED_PROVIDER:-openai}
+      EMBED_MODEL: ${EMBED_MODEL:-}
       # localhost inside a container is the container itself. This name is how
       # Docker Desktop exposes the host, where Ollama is running.
       OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}

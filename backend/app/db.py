@@ -39,7 +39,6 @@ def connect(settings, attempts: int = 30) -> None:
             _pool = pool
             log.info("connected to the database")
             ensure_settings_table()
-            reconcile_dimensions(settings.embed_dim)
             return
         except Exception as exc:
             last = exc
@@ -127,30 +126,51 @@ def current_dimensions() -> int | None:
     return int(row["dim"])
 
 
-def reconcile_dimensions(wanted: int) -> None:
-    """Resize the embedding column when the model changes.
+def reconcile_index(settings) -> bool:
+    """Make the passage index match the selected embedding model.
 
-    Vectors from different models are not comparable, so existing passages are
-    discarded and their documents queued for reindexing rather than left to
-    return confident nonsense.
+    Vectors from different models are not comparable, so when the model (or its
+    width) changes, existing passages are discarded and every document is queued
+    for reindexing rather than left to return confident nonsense. Returns True
+    when the index was cleared.
     """
+    wanted = settings.embed_dim
+    signature = settings.index_signature
+    stored = read_app_settings().get("index_signature")
     existing = current_dimensions()
-    if existing == wanted:
-        return
+
+    if existing == wanted and stored in (signature, None):
+        # None: a database from before the index recorded its model. Its
+        # vectors came from the old fixed default, which matches when the width does.
+        if stored is None:
+            write_app_settings({"index_signature": signature})
+        return False
 
     log.warning(
-        "embedding size changed (%s -> %s); clearing passages and queueing "
-        "documents for reindexing", existing, wanted,
+        "index built with %s, %s selected; clearing passages and queueing "
+        "documents for reindexing", stored or f"{existing} dimensions", signature,
     )
     with connection() as conn:
         conn.execute("DROP INDEX IF EXISTS chunks_vector_idx")
         conn.execute("TRUNCATE chunks")
-        conn.execute(f"ALTER TABLE chunks ALTER COLUMN embedding TYPE vector({wanted})")
+        conn.execute(f"ALTER TABLE chunks ALTER COLUMN embedding TYPE vector({int(wanted)})")
+        if settings.vector_indexed:
+            conn.execute(
+                "CREATE INDEX chunks_vector_idx ON chunks "
+                "USING hnsw (embedding vector_cosine_ops)"
+            )
+        else:
+            # Wider than HNSW allows: search compares every passage exactly.
+            # Slower on very large libraries, but correct.
+            log.warning("%d dimensions exceeds the vector index limit; searching "
+                        "without it", wanted)
         conn.execute(
-            "CREATE INDEX chunks_vector_idx ON chunks "
-            "USING hnsw (embedding vector_cosine_ops)"
+            "UPDATE documents SET status = 'pending', chunk_count = 0, progress = 0, "
+            "indexed_at = NULL, error = NULL WHERE status <> 'excluded'"
         )
         conn.execute(
-            "UPDATE documents SET status = 'pending', chunk_count = 0, "
-            "progress = 0, indexed_at = NULL"
+            "UPDATE documents SET chunk_count = 0, progress = 0, indexed_at = NULL "
+            "WHERE status = 'excluded'"
         )
+    write_app_settings({"index_signature": signature})
+    return True

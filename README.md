@@ -7,55 +7,72 @@ Three containers: a chat frontend, a FastAPI backend, and Postgres holding both
 the embeddings and the conversation history.
 
 ```bash
-cp .env.example .env        # add your OpenAI key
 docker compose up -d
 ```
 
-Open **http://localhost:8080**.
+Open **http://localhost:8080**, click the **gear icon** (top right), and add an
+API key. No `.env` file is needed: keys, providers and models are all set in the
+interface and kept in the database.
 
 ## Setup
 
-Put your OpenAI key in `.env`:
+1. **Settings → API keys.** Add a key for any of:
+   - **OpenAI** (`sk-…`)
+   - **Claude** from Anthropic (`sk-ant-…`); answers only, since Anthropic has no
+     embedding models
+   - **NVIDIA NIM**: an `nvapi-…` key for the hosted models at build.nvidia.com,
+     or the address of your own self-hosted NIM (usually no key)
+   - **Ollama** on your machine (no key, just its address)
 
-```bash
-OPENAI_API_KEY=sk-...
-```
-
-Then open the app, go to **Documents**, and press **Index new documents**.
-Anything in `knowledgebase/` is picked up automatically — that folder is mounted
-into the backend, so you can drop files in from your machine or upload them
-through the interface, whichever you prefer.
+   **Test** next to each one confirms the key works and how many models it offers.
+2. **Settings → Models.**
+   - **Answers:** pick a provider, then a model from its live list.
+   - **Search & index:** pick the embedding provider and model (OpenAI, NVIDIA
+     NIM or Ollama). The index is built with this model.
+3. **Documents → Index new documents.** Anything in `knowledgebase/` is picked
+   up automatically. That folder is mounted into the backend, so you can drop
+   files in from your machine or upload them through the interface.
 
 Indexing runs in the background with per-document progress. Only new or changed
 files are processed, so adding one PDF costs one PDF.
 
-### Writing answers with Ollama instead
+### Switching models
 
-Ollama runs on your machine, not in a container, so it keeps your GPU. In `.env`:
+- **Answer model:** switch any time. It applies from the next question, with no
+  restart and no reindexing.
+- **Search (embedding) model:** switching rebuilds the index. Vectors from
+  different models can't be compared, so when you save a new one the backend
+  first embeds a test sentence to check that the model works and measure its
+  width. It then clears the old passages and re-embeds every document with the
+  new model. If the new model can't be reached, nothing changes.
+- **Wide embedding models:** pgvector's index covers at most 2000 dimensions.
+  Wider models are asked for 1536 when they support it (OpenAI
+  `text-embedding-3-*`, NVIDIA's Matryoshka models). Otherwise search compares
+  every passage exactly, which is slower on very large libraries but still
+  correct.
 
-```bash
-LLM_PROVIDER=ollama
-OLLAMA_CHAT_MODEL=medgemma:4b
-OLLAMA_HOST=http://host.docker.internal:11434
-```
+### Ollama
 
-This changes who writes the answers, not how documents are searched — that is
-always `text-embedding-3-large`, so an OpenAI key is still required.
-
-`host.docker.internal` is how a container reaches your machine — `localhost`
-inside a container means the container itself.
+`host.docker.internal` (the default address) is how a container reaches your
+machine; `localhost` inside a container means the container itself.
 
 **If you get "connection refused":** Ollama listens on `127.0.0.1` by default and
 rejects traffic arriving from Docker. Set a system environment variable on
 Windows, `OLLAMA_HOST=0.0.0.0:11434`, then restart Ollama.
 
-To run Ollama as a container instead — simpler, but CPU-only unless you set up
-WSL2 with the NVIDIA container toolkit:
+To run Ollama as a container instead (simpler, but CPU-only unless you set up
+WSL2 with the NVIDIA container toolkit):
 
 ```bash
 docker compose --profile local-llm up -d
-# then in .env:  OLLAMA_HOST=http://ollama:11434
+# then in Settings → API keys → Ollama:  http://ollama:11434
 ```
+
+### Self-hosted NVIDIA NIM
+
+Under **NVIDIA NIM → Endpoints**, set the answers endpoint (for example
+`http://host.docker.internal:8000/v1`), and the embeddings endpoint if your
+embedding NIM runs separately. A key is only required for NVIDIA's hosted API.
 
 ## How it works
 
@@ -102,20 +119,25 @@ separated from the sentence that qualifies it.
 | Backend API | http://localhost:9000/api | 8000 was in use |
 | Postgres | localhost:5433 | 5432 is usually a local Postgres |
 
-All three are set in `.env` — change them if these clash too. Only the frontend
-port really matters; the backend and database are reachable between containers
+All three can be changed with environment variables (`FRONTEND_PORT`,
+`BACKEND_PORT`, `POSTGRES_PORT`) if these clash too. Only the frontend port
+really matters; the backend and database are reachable between containers
 regardless of what is published to your machine.
 
 ## Configuration
 
-Everything lives in `.env` and is read at startup.
+Providers, keys and models are set in the interface (**Settings**) and stored in
+the `app_settings` table. A value saved there takes precedence over the
+environment.
+
+Environment variables are optional. They act as defaults, for deployments that
+prefer them (see `.env.example`):
 
 | Setting | Default | Notes |
 |---|---|---|
-| `OPENAI_API_KEY` | — | required; search always uses OpenAI |
-| `LLM_PROVIDER` | `openai` | `openai` or `ollama` — affects answers only |
-| `OPENAI_CHAT_MODEL` | `gpt-4o-mini` | |
-| `EMBED_DIM` | `1536` | see below |
+| `LLM_PROVIDER` | `openai` | `openai`, `anthropic`, `nvidia` or `ollama` |
+| `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `NVIDIA_API_KEY` | none | or add them in Settings |
+| `EMBED_PROVIDER` / `EMBED_MODEL` | `openai` / `text-embedding-3-large` | the model the index is built with |
 | `PDF_EXTRACTION` | `fast` | `fast` or `thorough` |
 | `PASSAGES` | `8` | passages each specialist reads per question |
 | `QUERY_VARIANTS` | `4` | rephrasings searched per specialist |
@@ -124,21 +146,8 @@ Everything lives in `.env` and is read at startup.
 | `ENABLE_REVIEW` | `true` | consultant's review pass on multi-specialist answers |
 | `ENABLE_SUGGESTIONS` | `true` | three follow-up questions after each answer |
 
-**The embedding model is fixed in code** as `openai/text-embedding-3-large`
-(`backend/app/config.py`). Search only works if every passage and every question
-go through the same model, and changing it invalidates the entire index, so it
-is not exposed as a setting. Setting `EMBED_PROVIDER` or `OPENAI_EMBED_MODEL` in
-the environment has no effect.
-
-One consequence: **an OpenAI key is always required**, even with
-`LLM_PROVIDER=ollama`. Ollama can write the answers locally, but indexing and
-search still call OpenAI.
-
-**On `EMBED_DIM`:** the model produces 3072 dimensions, but pgvector's index
-tops out at 2000. Asking for 1536 keeps the index usable, halves storage, and
-still scores better than `text-embedding-3-small` at the same width. Changing it
-clears the passages and marks every document for reindexing, because vectors of
-different widths are not comparable.
+**API keys are stored in plain text** in the local Postgres database. The API
+has no login, so keep ports 8080 and 9000 off public networks.
 
 **On `PDF_EXTRACTION`:** measured on a 1,059-page textbook, `thorough` takes
 about 0.9 s per page — it keeps headings and reads scanned pages — while `fast`
@@ -148,7 +157,7 @@ still adjusting things.
 ## Cost
 
 Indexing roughly 9,400 pages (~6M tokens) with `text-embedding-3-large` costs
-well under a dollar, one time. The recurring cost is answering: each question
+well under a dollar, one time. Local embeddings through Ollama cost nothing. The recurring cost is answering: each question
 sends about 10k tokens of passages to the chat model. Lower `PASSAGES` to spend
 less per question.
 
@@ -161,6 +170,7 @@ Everything is in Postgres, in the `pgdata` volume.
 | `documents` | one row per file: page count, hash, index status, progress |
 | `chunks` | passage text, page range, and its embedding |
 | `chats` / `messages` | conversation history, with citations per answer |
+| `app_settings` | keys, providers and models saved from Settings, and which model built the index |
 
 ```bash
 docker compose exec db psql -U aidoctor -d aidoctor -c '\dt'
@@ -172,12 +182,12 @@ docker compose down -v       # stop and erase the database
 
 ```
 docker-compose.yml
-.env                     all configuration
+.env                     optional; Settings in the interface replaces it
 db/init.sql              schema, applied on first start
 backend/
-  app/config.py          settings from the environment
-  app/db.py              connection pool, embedding-size reconciliation
-  app/providers.py       OpenAI and Ollama, chat and embeddings
+  app/config.py          settings: saved values first, environment second
+  app/db.py              connection pool, saved settings, index reconciliation
+  app/providers.py       OpenAI, Claude, NVIDIA NIM, Ollama: chat and embeddings
   app/ingest.py          PDF → passages → Postgres
   app/retrieve.py        vector + full-text search, rank fusion
   app/team.py            the panel: prompts and roles, triage → review → answer

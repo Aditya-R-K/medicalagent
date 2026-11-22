@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 
 from . import config, db, ingest, store
 from .pipeline import Pipeline
-from .providers import ProviderError, available_models, list_models
+from .providers import ProviderError, available_models, list_models, probe_embedding
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,6 +36,7 @@ async def lifespan(_: FastAPI):
         log.warning("configuration: %s", issue)
     db.connect(settings)
     apply_saved_settings()
+    db.reconcile_index(settings)
     ingest.scan(settings)
     yield
     db.close()
@@ -60,17 +61,22 @@ class Question(BaseModel):
 
 class ConfigUpdate(BaseModel):
     """Omitted (null) leaves a value unchanged; an empty string clears the saved
-    value, so the one from .env (or the built-in default) applies again."""
+    value, so the environment's (or the built-in default) applies again."""
 
-    llm_provider: str | None = None
+    llm_provider: str | None = Field(None, max_length=40)
     openai_api_key: str | None = Field(None, max_length=500)
     openai_base_url: str | None = Field(None, max_length=500)
     openai_chat_model: str | None = Field(None, max_length=200)
+    anthropic_api_key: str | None = Field(None, max_length=500)
+    anthropic_chat_model: str | None = Field(None, max_length=200)
     nvidia_api_key: str | None = Field(None, max_length=500)
     nvidia_base_url: str | None = Field(None, max_length=500)
+    nvidia_embed_base_url: str | None = Field(None, max_length=500)
     nvidia_chat_model: str | None = Field(None, max_length=200)
     ollama_host: str | None = Field(None, max_length=500)
     ollama_chat_model: str | None = Field(None, max_length=200)
+    embed_provider: str | None = Field(None, max_length=40)
+    embed_model: str | None = Field(None, max_length=200)
 
 
 class ModelQuery(BaseModel):
@@ -78,6 +84,7 @@ class ModelQuery(BaseModel):
     can be tried before it is kept."""
 
     provider: str
+    kind: str = "chat"  # chat | embedding
     api_key: str | None = Field(None, max_length=500)
     base_url: str | None = Field(None, max_length=500)
     host: str | None = Field(None, max_length=500)
@@ -139,31 +146,41 @@ def read_models(kind: str = "chat") -> dict:
     return {"models": available_models(settings, kind)}
 
 
+def _key_info(key: str, saved: dict) -> dict:
+    value = getattr(settings, key) or ""
+    return {
+        "key_set": bool(value),
+        "key_hint": _mask(value),
+        "key_source": "saved" if saved.get(key) else ("env" if value else "none"),
+    }
+
+
 @app.get("/api/config")
 def read_config() -> dict:
-    """Provider settings for the settings panel. Keys are never sent back whole."""
+    """Everything the settings panel shows. Keys are never sent back whole."""
     saved = db.read_app_settings()
-
-    def source(key: str) -> str:
-        if saved.get(key):
-            return "saved"
-        return "env" if (getattr(settings, key) or "") else "none"
-
+    indexed = db.query_one(
+        "SELECT count(*) FILTER (WHERE status = 'indexed') AS indexed, "
+        "count(*) FILTER (WHERE status <> 'excluded') AS total, "
+        "coalesce(sum(chunk_count) FILTER (WHERE status = 'indexed'), 0) AS passages "
+        "FROM documents"
+    )
     return {
         "llm_provider": settings.llm_provider,
         "providers": {
             "openai": {
-                "key_set": bool(settings.openai_api_key),
-                "key_hint": _mask(settings.openai_api_key),
-                "key_source": source("openai_api_key"),
+                **_key_info("openai_api_key", saved),
                 "base_url": settings.openai_base_url,
                 "model": settings.openai_chat_model,
             },
+            "anthropic": {
+                **_key_info("anthropic_api_key", saved),
+                "model": settings.anthropic_chat_model,
+            },
             "nvidia": {
-                "key_set": bool(settings.nvidia_api_key),
-                "key_hint": _mask(settings.nvidia_api_key),
-                "key_source": source("nvidia_api_key"),
+                **_key_info("nvidia_api_key", saved),
                 "base_url": settings.nvidia_base_url,
+                "embed_base_url": settings.nvidia_embed_base_url,
                 "model": settings.nvidia_chat_model,
             },
             "ollama": {
@@ -171,40 +188,101 @@ def read_config() -> dict:
                 "model": settings.ollama_chat_model,
             },
         },
-        "embedder": f"{settings.embed_provider}:{settings.embed_model}",
+        "embedding": {
+            "provider": settings.embed_provider,
+            "model": settings.embed_model,
+            "dimensions": settings.embed_dim,
+            "shortened": settings.embed_send_dimensions,
+            "vector_index": settings.vector_indexed,
+        },
+        "index": {
+            "built_with": saved.get("index_signature"),
+            "documents_indexed": indexed["indexed"],
+            "documents_total": indexed["total"],
+            "passages": indexed["passages"],
+            "indexing": ingest.is_running(),
+        },
         "problems": settings.problems(),
     }
 
 
 @app.put("/api/config")
-def update_config(body: ConfigUpdate) -> dict:
-    changes = body.model_dump(exclude_none=True)
-    if "llm_provider" in changes:
-        changes["llm_provider"] = changes["llm_provider"].strip().lower()
-        if changes["llm_provider"] not in config.LLM_PROVIDERS:
-            raise HTTPException(400, f"unknown provider '{changes['llm_provider']}'")
-    db.write_app_settings(
-        {key: (value.strip() or None) for key, value in changes.items()}
-    )
+def update_config(body: ConfigUpdate, tasks: BackgroundTasks) -> dict:
+    changes = {k: v.strip() for k, v in body.model_dump(exclude_none=True).items()}
+    for key, allowed in (("llm_provider", config.LLM_PROVIDERS),
+                         ("embed_provider", config.EMBED_PROVIDERS)):
+        if key in changes:
+            changes[key] = changes[key].lower()
+            if changes[key] and changes[key] not in allowed:
+                raise HTTPException(400, f"unknown provider '{changes[key]}'")
+
+    saved = db.read_app_settings()
+    merged = {**saved, **changes}
+    if "embed_provider" in changes and "embed_model" not in changes \
+            and changes["embed_provider"] != settings.embed_provider:
+        merged.pop("embed_model", None)  # the old model belongs to the old provider
+
+    # A different embedding model means a different index. Measure the new
+    # model first: if it cannot be reached, nothing is saved and the current
+    # index stays as it is.
+    candidate = config.load({k: v for k, v in merged.items() if k not in config.MEASURED})
+    embedding_changed = (candidate.embed_provider, candidate.embed_model) != (
+        settings.embed_provider, settings.embed_model)
+    writes: dict[str, str | None] = {k: (v or None) for k, v in changes.items()}
+    if "embed_model" not in changes and "embed_model" not in merged:
+        writes["embed_model"] = None
+
+    if embedding_changed:
+        if ingest.is_running():
+            raise HTTPException(
+                409, "Indexing is running. Wait for it to finish before changing "
+                     "the search model.")
+        problem = candidate.key_problem(candidate.embed_provider, "search")
+        if problem:
+            raise HTTPException(400, problem)
+        try:
+            dimensions, shortened = probe_embedding(candidate)
+        except ProviderError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        writes["embed_provider"] = candidate.embed_provider
+        writes["embed_model"] = candidate.embed_model
+        writes["embed_dim"] = str(dimensions)
+        writes["embed_send_dimensions"] = "true" if shortened else "false"
+
+    db.write_app_settings(writes)
     apply_saved_settings()
-    return read_config()
+
+    reindexing = False
+    if embedding_changed and db.reconcile_index(settings):
+        pending = db.query_one(
+            "SELECT count(*) AS n FROM documents WHERE status = 'pending'")["n"]
+        if pending and not settings.problems() and not ingest.is_running():
+            tasks.add_task(ingest.index_pending, settings, False)
+            reindexing = True
+    return {**read_config(), "embedding_changed": embedding_changed,
+            "reindexing": reindexing}
 
 
 @app.post("/api/config/models")
 def query_models(body: ModelQuery) -> dict:
     provider = body.provider.strip().lower()
-    if provider not in config.LLM_PROVIDERS:
-        raise HTTPException(400, f"unknown provider '{provider}'")
+    kind = "embedding" if body.kind == "embedding" else "chat"
+    allowed = config.EMBED_PROVIDERS if kind == "embedding" else config.LLM_PROVIDERS
+    if provider not in allowed:
+        raise HTTPException(400, f"{provider} has no {kind} models here")
     trial = {}
     if body.api_key and body.api_key.strip():
         trial[f"{provider}_api_key"] = body.api_key.strip()
-    if body.base_url and body.base_url.strip():
-        trial[f"{provider}_base_url"] = body.base_url.strip()
+    if body.base_url and body.base_url.strip() and provider in ("openai", "nvidia"):
+        field = "nvidia_embed_base_url" if (provider == "nvidia" and kind == "embedding") \
+            else f"{provider}_base_url"
+        trial[field] = body.base_url.strip()
     if body.host and body.host.strip():
         trial["ollama_host"] = body.host.strip()
     candidate = replace(settings, **trial) if trial else settings
     try:
-        return {"provider": provider, "models": list_models(candidate, provider)}
+        return {"provider": provider, "kind": kind,
+                "models": list_models(candidate, provider, kind)}
     except ProviderError as exc:
         raise HTTPException(400, str(exc)) from exc
 

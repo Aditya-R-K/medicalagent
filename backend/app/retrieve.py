@@ -144,7 +144,7 @@ class Retriever:
         # One embeddings request for every query at once, instead of a round
         # trip per variant.
         texts = queries + ([hypothetical] if hypothetical else [])
-        vectors = self.embedder.embed(texts)
+        vectors = self.embedder.embed(texts, kind="query")
 
         for query, vector in zip(queries, vectors):
             absorb("meaning", self._nearest(vector, limit))

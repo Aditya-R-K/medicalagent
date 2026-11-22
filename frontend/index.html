@@ -99,93 +99,125 @@
         </button>
       </header>
 
-      <div class="panel-body">
-        <section class="field-group">
-          <h3>Model that writes the answers</h3>
-          <div class="segmented" id="provider-tabs" role="tablist">
-            <button type="button" role="tab" data-provider="openai">OpenAI</button>
-            <button type="button" role="tab" data-provider="nvidia">NVIDIA</button>
-            <button type="button" role="tab" data-provider="ollama">Ollama</button>
-          </div>
-          <p class="hint" id="provider-active-note"></p>
-        </section>
+      <nav class="settings-tabs" role="tablist">
+        <button type="button" role="tab" data-tab="models" aria-selected="true">Models</button>
+        <button type="button" role="tab" data-tab="keys" aria-selected="false">API keys</button>
+      </nav>
 
-        <!-- OpenAI -->
-        <section class="provider-pane" data-pane="openai">
-          <label class="field">
-            <span class="field-label">API key <span class="source-tag" data-source-for="openai"></span></span>
+      <div class="panel-body">
+        <!-- ============================================================ models -->
+        <div class="tab-pane" data-pane="models">
+          <section class="field-group">
+            <h3>Answers <span class="hint-inline">the model that reads the passages and writes the reply</span></h3>
+            <div class="segmented four" id="chat-providers" role="radiogroup">
+              <button type="button" data-provider="openai">OpenAI</button>
+              <button type="button" data-provider="anthropic">Claude</button>
+              <button type="button" data-provider="nvidia">NVIDIA NIM</button>
+              <button type="button" data-provider="ollama">Ollama</button>
+            </div>
+            <div class="model-row">
+              <select id="chat-model" aria-label="Answer model"></select>
+              <button type="button" class="ghost-btn" id="chat-refresh">Refresh</button>
+            </div>
+            <input type="text" class="custom-model" id="chat-model-custom" placeholder="Model name" hidden>
+            <p class="hint" id="chat-note"></p>
+          </section>
+
+          <section class="field-group">
+            <h3>Search &amp; index <span class="hint-inline">the embedding model the index is built with</span></h3>
+            <div class="segmented three" id="embed-providers" role="radiogroup">
+              <button type="button" data-provider="openai">OpenAI</button>
+              <button type="button" data-provider="nvidia">NVIDIA NIM</button>
+              <button type="button" data-provider="ollama">Ollama</button>
+            </div>
+            <div class="model-row">
+              <select id="embed-model" aria-label="Embedding model"></select>
+              <button type="button" class="ghost-btn" id="embed-refresh">Refresh</button>
+            </div>
+            <input type="text" class="custom-model" id="embed-model-custom" placeholder="Embedding model name" hidden>
+            <div class="index-card" id="index-card"></div>
+            <p class="warn" id="embed-warning" hidden></p>
+          </section>
+        </div>
+
+        <!-- ============================================================== keys -->
+        <div class="tab-pane" data-pane="keys" hidden>
+          <p class="hint top">Keys are stored in this app's own database, never in a file. Leave a field blank to keep the key that's there.</p>
+
+          <section class="key-card" data-key="openai">
+            <div class="key-head">
+              <strong>OpenAI</strong>
+              <span class="source-tag" data-source-for="openai"></span>
+              <span class="spacer"></span>
+              <button type="button" class="ghost-btn small" data-test="openai">Test</button>
+            </div>
             <div class="secret">
               <input type="password" id="openai-key" autocomplete="off" spellcheck="false" placeholder="sk-…">
-              <button type="button" class="reveal" data-reveal="openai-key" aria-label="Show key">Show</button>
+              <button type="button" class="reveal" data-reveal="openai-key">Show</button>
             </div>
-            <span class="hint">Also used for search (text-embedding-3-large), whichever provider writes the answers.</span>
-          </label>
-          <div class="field">
-            <span class="field-label">Model</span>
-            <div class="model-row">
-              <select id="openai-model"></select>
-              <button type="button" class="ghost-btn" data-load="openai">Refresh list</button>
-            </div>
-            <input type="text" class="custom-model" id="openai-model-custom" placeholder="Model name, e.g. gpt-4o" hidden>
-          </div>
-          <details class="advanced">
-            <summary>Advanced</summary>
-            <label class="field">
-              <span class="field-label">Base URL</span>
+            <details class="advanced">
+              <summary>Base URL</summary>
               <input type="text" id="openai-base" placeholder="https://api.openai.com/v1">
-            </label>
-          </details>
-        </section>
+            </details>
+            <p class="key-status" data-status-for="openai"></p>
+          </section>
 
-        <!-- NVIDIA -->
-        <section class="provider-pane" data-pane="nvidia" hidden>
-          <label class="field">
-            <span class="field-label">API key <span class="source-tag" data-source-for="nvidia"></span></span>
+          <section class="key-card" data-key="anthropic">
+            <div class="key-head">
+              <strong>Claude</strong><span class="by">Anthropic</span>
+              <span class="source-tag" data-source-for="anthropic"></span>
+              <span class="spacer"></span>
+              <button type="button" class="ghost-btn small" data-test="anthropic">Test</button>
+            </div>
+            <div class="secret">
+              <input type="password" id="anthropic-key" autocomplete="off" spellcheck="false" placeholder="sk-ant-…">
+              <button type="button" class="reveal" data-reveal="anthropic-key">Show</button>
+            </div>
+            <p class="hint">Answers only: Anthropic has no embedding models, so pick another provider for search.</p>
+            <p class="key-status" data-status-for="anthropic"></p>
+          </section>
+
+          <section class="key-card" data-key="nvidia">
+            <div class="key-head">
+              <strong>NVIDIA NIM</strong>
+              <span class="source-tag" data-source-for="nvidia"></span>
+              <span class="spacer"></span>
+              <button type="button" class="ghost-btn small" data-test="nvidia">Test</button>
+            </div>
             <div class="secret">
               <input type="password" id="nvidia-key" autocomplete="off" spellcheck="false" placeholder="nvapi-…">
-              <button type="button" class="reveal" data-reveal="nvidia-key" aria-label="Show key">Show</button>
+              <button type="button" class="reveal" data-reveal="nvidia-key">Show</button>
             </div>
-            <span class="hint">Create one at build.nvidia.com. Search still uses your OpenAI key.</span>
-          </label>
-          <div class="field">
-            <span class="field-label">Model</span>
-            <div class="model-row">
-              <select id="nvidia-model"></select>
-              <button type="button" class="ghost-btn" data-load="nvidia">Refresh list</button>
-            </div>
-            <input type="text" class="custom-model" id="nvidia-model-custom" placeholder="Model name, e.g. meta/llama-3.3-70b-instruct" hidden>
-          </div>
-          <details class="advanced">
-            <summary>Advanced</summary>
-            <label class="field">
-              <span class="field-label">Base URL</span>
-              <input type="text" id="nvidia-base" placeholder="https://integrate.api.nvidia.com/v1">
-            </label>
-          </details>
-        </section>
+            <p class="hint">Hosted models at build.nvidia.com need an <code>nvapi-</code> key. A self-hosted NIM usually needs no key; set its address below.</p>
+            <details class="advanced">
+              <summary>Endpoints (self-hosted NIM)</summary>
+              <label class="field">
+                <span class="field-label">Answers endpoint</span>
+                <input type="text" id="nvidia-base" placeholder="https://integrate.api.nvidia.com/v1">
+              </label>
+              <label class="field">
+                <span class="field-label">Embeddings endpoint</span>
+                <input type="text" id="nvidia-embed-base" placeholder="Same as answers endpoint">
+              </label>
+            </details>
+            <p class="key-status" data-status-for="nvidia"></p>
+          </section>
 
-        <!-- Ollama -->
-        <section class="provider-pane" data-pane="ollama" hidden>
-          <label class="field">
-            <span class="field-label">Ollama host</span>
-            <input type="text" id="ollama-host" placeholder="http://host.docker.internal:11434">
-            <span class="hint">Runs on your machine, no key needed. Search still uses your OpenAI key.</span>
-          </label>
-          <div class="field">
-            <span class="field-label">Model</span>
-            <div class="model-row">
-              <select id="ollama-model"></select>
-              <button type="button" class="ghost-btn" data-load="ollama">Refresh list</button>
+          <section class="key-card" data-key="ollama">
+            <div class="key-head">
+              <strong>Ollama</strong><span class="by">local, no key</span>
+              <span class="spacer"></span>
+              <button type="button" class="ghost-btn small" data-test="ollama">Test</button>
             </div>
-            <input type="text" class="custom-model" id="ollama-model-custom" placeholder="Model name, e.g. medgemma:4b" hidden>
-          </div>
-        </section>
+            <input type="text" id="ollama-host" placeholder="http://host.docker.internal:11434">
+            <p class="key-status" data-status-for="ollama"></p>
+          </section>
+        </div>
 
         <p class="settings-message" id="settings-message" role="status"></p>
       </div>
 
       <footer class="panel-foot">
-        <button type="button" class="ghost-btn" id="test-provider">Test connection</button>
         <span class="spacer"></span>
         <button type="button" class="ghost-btn" id="cancel-settings">Cancel</button>
         <button type="button" class="primary" id="save-settings">Save</button>
