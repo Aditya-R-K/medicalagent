@@ -89,6 +89,51 @@ def ensure_settings_table() -> None:
         )
         """
     )
+    ensure_usage_schema()
+
+
+def ensure_usage_schema() -> None:
+    """Token accounting and conversation memory, added to existing databases.
+
+    usage_events holds one row per model call (or per indexed document), so
+    analytics can break spend down by chat, model and step. Rows outlive the
+    chat they belong to: deleting a chat does not rewrite what was spent.
+    """
+    with connection() as conn:
+        conn.execute(
+            "ALTER TABLE messages ADD COLUMN IF NOT EXISTS usage JSONB NOT NULL DEFAULT '{}'::jsonb")
+        conn.execute("ALTER TABLE chats ADD COLUMN IF NOT EXISTS summary TEXT NOT NULL DEFAULT ''")
+        conn.execute(
+            "ALTER TABLE chats ADD COLUMN IF NOT EXISTS summarized_upto BIGINT NOT NULL DEFAULT 0")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS usage_events (
+                id                 BIGSERIAL PRIMARY KEY,
+                chat_id            BIGINT REFERENCES chats (id) ON DELETE SET NULL,
+                message_id         BIGINT REFERENCES messages (id) ON DELETE SET NULL,
+                document_id        BIGINT REFERENCES documents (id) ON DELETE SET NULL,
+                step               TEXT    NOT NULL,
+                provider           TEXT    NOT NULL DEFAULT '',
+                model              TEXT    NOT NULL DEFAULT '',
+                input_tokens       INTEGER NOT NULL DEFAULT 0,
+                output_tokens      INTEGER NOT NULL DEFAULT 0,
+                cached_tokens      INTEGER NOT NULL DEFAULT 0,
+                cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                calls              INTEGER NOT NULL DEFAULT 1,
+                created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS usage_events_created_idx ON usage_events (created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS usage_events_chat_idx ON usage_events (chat_id)")
+        # Exact locations for references: the line range a passage occupies on
+        # its page(s), and the book's own title and author from the PDF. Passages
+        # indexed before this have no line numbers until they are reindexed.
+        conn.execute("ALTER TABLE chunks ADD COLUMN IF NOT EXISTS line_start INTEGER")
+        conn.execute("ALTER TABLE chunks ADD COLUMN IF NOT EXISTS line_end INTEGER")
+        conn.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS title TEXT NOT NULL DEFAULT ''")
+        conn.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS author TEXT NOT NULL DEFAULT ''")
 
 
 def read_app_settings() -> dict[str, str]:

@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterator
 
-from . import db
+from . import db, store
 from .providers import EmbeddingModel, count_tokens
 from .retrieve import vector_literal
 
@@ -39,6 +39,8 @@ class Block:
     page: int
     section: str
     tokens: int = 0
+    line_start: int | None = None   # line numbers on the page, for exact references
+    line_end: int | None = None
 
     def __post_init__(self) -> None:
         self.tokens = self.tokens or count_tokens(self.text)
@@ -90,6 +92,62 @@ def publication_year(filename: str, body: str) -> int | None:
     return max(from_body) if from_body else None
 
 
+def document_metadata(path: Path) -> tuple[str, str]:
+    """(title, author) from a PDF's own metadata, when it holds anything useful.
+
+    Many PDFs carry junk here ("Untitled", "Microsoft Word - ch3.docx"); that
+    is discarded and the reference falls back to a title made from the name.
+    """
+    if path.suffix.lower() not in PDF_SUFFIXES:
+        return "", ""
+    try:
+        import pymupdf
+
+        with pymupdf.open(str(path)) as document:
+            meta = document.metadata or {}
+    except Exception:
+        return "", ""
+    title = " ".join((meta.get("title") or "").split())
+    author = " ".join((meta.get("author") or "").split())
+    junk = ("untitled", "microsoft word", ".doc", ".pdf", "unknown", "title")
+    if len(title) < 4 or any(j in title.lower() for j in junk):
+        title = ""
+    if len(author) < 3 or author.lower() in ("unknown", "author", "admin", "user"):
+        author = ""
+    return title[:300], author[:300]
+
+
+def unwrap_lines(text: str) -> list[tuple[str, int, int]]:
+    """Rejoin PDF line wrapping into paragraphs, keeping where each came from.
+
+    Returns (paragraph, first line, last line), lines numbered from 1 as they
+    sit on the page. Those numbers are what lets a reference say "p. 412,
+    lines 14-31" rather than just the page.
+    """
+    output: list[tuple[str, int, int]] = []
+    buffer: list[str] = []
+    first = 0
+    for number, raw in enumerate(text.split("\n"), start=1):
+        line = raw.strip()
+        if not line:
+            if buffer:
+                output.append((" ".join(buffer), first, number - 1))
+                buffer = []
+            continue
+        if not buffer:
+            first = number
+        if buffer and buffer[-1].endswith("-"):
+            buffer[-1] = buffer[-1][:-1] + line
+            continue
+        buffer.append(line)
+        if line.endswith((".", ":", ";", "?", "!")):
+            output.append((" ".join(buffer), first, number))
+            buffer = []
+    if buffer:
+        output.append((" ".join(buffer), first, len(text.split("\n"))))
+    return output
+
+
 def unwrap(text: str) -> str:
     """Rejoin PDF line wrapping into sentences and repair split words."""
     output: list[str] = []
@@ -113,14 +171,21 @@ def unwrap(text: str) -> str:
     return "\n\n".join(output)
 
 
-def read_pages(path: Path, mode: str, on_page=None) -> Iterator[tuple[int, str]]:
-    """Yield (page number, text), reading in batches from one open handle.
+def read_pages(path: Path, mode: str, on_page=None
+               ) -> Iterator[tuple[int, str, list[tuple[int, int]] | None]]:
+    """Yield (page number, text, line spans), reading in batches from one handle.
+
+    Line spans give, for each non-empty line of `text`, the range of original
+    lines it came from; None where the original lines are not known (the
+    'thorough' markdown conversion rewrites the layout).
 
     'thorough' keeps headings and reads scanned pages, at around a second per
     page. 'fast' is roughly two hundred times quicker for about 97% of the text.
     """
     if path.suffix.lower() not in PDF_SUFFIXES:
-        yield 1, path.read_text(encoding="utf-8", errors="replace")
+        body = path.read_text(encoding="utf-8", errors="replace")
+        spans = [(n, n) for n, line in enumerate(body.splitlines(), start=1) if line.strip()]
+        yield 1, body, spans
         return
 
     import pymupdf
@@ -139,6 +204,7 @@ def read_pages(path: Path, mode: str, on_page=None) -> Iterator[tuple[int, str]]
         for start in range(0, total, PAGE_BATCH):
             indices = list(range(start, min(start + PAGE_BATCH, total)))
             texts: list[str] = []
+            spans: list = []
             if to_markdown is not None:
                 try:
                     texts = [
@@ -148,9 +214,12 @@ def read_pages(path: Path, mode: str, on_page=None) -> Iterator[tuple[int, str]]
                 except Exception as exc:
                     log.warning("%s: %s; falling back to fast extraction", path.name, exc)
             if not texts:
-                texts = [unwrap(document.load_page(i).get_text()) for i in indices]
+                for i in indices:
+                    paragraphs = unwrap_lines(document.load_page(i).get_text())
+                    texts.append("\n\n".join(p[0] for p in paragraphs))
+                    spans.append([(p[1], p[2]) for p in paragraphs])
             for offset, text in enumerate(texts):
-                yield indices[offset] + 1, text
+                yield indices[offset] + 1, text, (spans[offset] if spans else None)
             if on_page:
                 on_page(min(start + PAGE_BATCH, total), total)
 
@@ -159,17 +228,28 @@ def parse(path: Path, mode: str, on_page=None) -> Parsed:
     result = Parsed()
     stack: list[str] = []
 
-    for number, text in read_pages(path, mode, on_page):
+    for number, text, spans in read_pages(path, mode, on_page):
         result.pages = number
         buffer: list[str] = []
+        lines: list[tuple[int, int]] = []
+        seen = 0  # non-empty lines so far, to look up each one's span
 
         def flush() -> None:
             joined = "\n".join(buffer).strip()
             buffer.clear()
+            first = min((a for a, _ in lines), default=None)
+            last = max((b for _, b in lines), default=None)
+            lines.clear()
             if joined:
-                result.blocks.append(Block(joined, number, " > ".join(stack)))
+                result.blocks.append(Block(joined, number, " > ".join(stack),
+                                           line_start=first, line_end=last))
 
         for line in text.splitlines():
+            if line.strip():
+                span = spans[seen] if spans and seen < len(spans) else None
+                seen += 1
+            else:
+                span = None
             heading = HEADING.match(line.strip())
             if heading:
                 flush()
@@ -180,6 +260,8 @@ def parse(path: Path, mode: str, on_page=None) -> Parsed:
                 flush()
             else:
                 buffer.append(line.rstrip())
+                if span:
+                    lines.append(span)
         flush()
 
     result.year = publication_year(
@@ -200,6 +282,8 @@ class Passage:
     section: str
     page_start: int
     page_end: int
+    line_start: int | None = None
+    line_end: int | None = None
 
 
 def _pack(blocks: list[Block], budget: int) -> list[list[Block]]:
@@ -228,7 +312,8 @@ def _split(block: Block, budget: int, overlap: int) -> list[Block]:
         window = words[start : start + size]
         if not window:
             break
-        pieces.append(Block(" ".join(window), block.page, block.section))
+        pieces.append(Block(" ".join(window), block.page, block.section,
+                            line_start=block.line_start, line_end=block.line_end))
         if start + size >= len(words):
             break
     return pieces
@@ -253,6 +338,8 @@ def to_passages(parsed: Parsed, settings) -> list[Passage]:
                     section=group[0].section,
                     page_start=min(pages),
                     page_end=max(pages),
+                    line_start=group[0].line_start,
+                    line_end=group[-1].line_end,
                 )
             )
             tail = " ".join(body.split()[-max(1, int(settings.child_overlap / 1.3)) :])
@@ -287,12 +374,13 @@ def scan(settings) -> list[dict]:
         digest = file_hash(path)
         record = known.get(name)
         if record is None:
+            title, author = document_metadata(path)
             db.execute(
                 """
-                INSERT INTO documents (filename, content_hash, pages, size_bytes)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO documents (filename, content_hash, pages, size_bytes, title, author)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 """,
-                (name, digest, page_count(path), path.stat().st_size),
+                (name, digest, page_count(path), path.stat().st_size, title, author),
             )
         elif record["content_hash"] != digest:
             # An excluded document stays excluded even when its file changes;
@@ -384,6 +472,8 @@ def _index_one(settings, embedder: EmbeddingModel, record: dict) -> None:
         written = 0
         batch = 256
         refused_before = embedder.rejected
+        spent: list[dict] = []
+        embedder.meter = spent.append
         for start in range(0, len(passages), batch):
             window = passages[start : start + batch]
             # A passage the provider's content screening refused comes back as
@@ -395,13 +485,13 @@ def _index_one(settings, embedder: EmbeddingModel, record: dict) -> None:
                         """
                         INSERT INTO chunks
                             (document_id, text, parent_text, section,
-                             page_start, page_end, embedding)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s::vector)
+                             page_start, page_end, line_start, line_end, embedding)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::vector)
                         """,
                         [
                             (
                                 document_id, p.text, p.parent_text, p.section,
-                                p.page_start, p.page_end,
+                                p.page_start, p.page_end, p.line_start, p.line_end,
                                 vector_literal(vector) if vector is not None else None,
                             )
                             for p, vector in zip(window, vectors)
@@ -414,6 +504,18 @@ def _index_one(settings, embedder: EmbeddingModel, record: dict) -> None:
             )
 
         refused = embedder.rejected - refused_before
+        embedder.meter = None
+        if spent:
+            # One analytics row per document: what indexing it cost.
+            store.record_usage([{
+                "step": "index", "provider": spent[0]["provider"], "model": spent[0]["model"],
+                "input": sum(r["input"] for r in spent), "output": 0, "cached": 0,
+                "cache_write": 0, "calls": len(spent),
+            }], document_id=document_id)
+        title, author = document_metadata(path)
+        if title or author:
+            db.execute("UPDATE documents SET title = %s, author = %s WHERE id = %s",
+                       (title, author, document_id))
         note = (
             f"{refused} of {written} passages were refused by {embedder.name}'s content "
             "safety screening; they are searchable by keyword only."

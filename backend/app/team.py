@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from dataclasses import dataclass, field
 
 from .providers import ChatModel, count_tokens
@@ -118,7 +119,7 @@ in an exam or on the ward.
 remembering. Skip it for a one-line lookup.
   - Answer in the language the student wrote in.
 
-{mode_guidance}
+{profile}{mode_guidance}
 
 Markdown: ### headings only when the answer has distinct parts, **bold** for \
 key terms, a table only for a genuine comparison, prose over bullets unless the \
@@ -184,6 +185,17 @@ understanding the topic, likely answerable from the same documents.
 Return JSON: {"questions": ["...", "...", "..."]}
 Exactly 3, each short, standalone and specific. No numbering."""
 
+MEMORY = """\
+You keep the running memory of a tutoring conversation with a medical student. \
+Update the summary with the new turns below.
+
+Keep: the topics and conditions discussed, the student's goals and level as \
+they reveal them, key facts already established (with doses and figures as \
+given), what they found confusing, and open threads they may return to. Drop \
+pleasantries and anything superseded.
+
+Write at most 180 words of plain notes. Output only the updated summary."""
+
 CHAT = """\
 You are a medical study assistant. You answer a medical student's questions \
 from the documents they have uploaded, citing the page each fact comes from. \
@@ -227,6 +239,70 @@ class Consultation:
     repaired: bool = False
     answer: str = ""
     suggestions: list[str] = field(default_factory=list)
+    usage: dict = field(default_factory=dict)      # totals, for the message
+    records: list[dict] = field(default_factory=list)  # per call, for analytics
+
+
+LEVELS = {
+    "preclinical": "a pre-clinical MBBS student (years 1-2): build from basic "
+                   "science, define terms, favour mechanisms over management detail",
+    "clinical": "a clinical MBBS student (years 3-5): connect mechanism to "
+                "presentation and management, highlight what is examinable",
+    "intern": "an intern or junior resident: practical, decision-focused, doses "
+              "and monitoring first",
+    "pg": "a postgraduate resident: specialist depth, nuance and controversies",
+    "phd": "a PhD or research student: mechanistic depth, the strength and "
+           "limits of the evidence as the sources state them, precise terminology",
+}
+LENGTHS = {
+    "concise": "Keep it tight: the essentials only.",
+    "detailed": "Go deep: cover every relevant point the sources give.",
+}
+
+
+def profile_text(settings) -> str:
+    """The student's study profile, as a line or two for the writer."""
+    parts = []
+    level = LEVELS.get(getattr(settings, "learner_level", "") or "")
+    if level:
+        parts.append(f"The student is {level}.")
+    exam = (getattr(settings, "exam_target", "") or "").strip()
+    if exam:
+        parts.append(f"They are preparing for {exam}: make High-yield what that exam rewards.")
+    length = LENGTHS.get(getattr(settings, "answer_length", "") or "")
+    if length:
+        parts.append(length)
+    return ("Student: " + " ".join(parts) + "\n\n") if parts else ""
+
+
+class Meter:
+    """Token use for one question, across every model and embedding call.
+
+    Calls report from several threads (the checker and the suggester run side
+    by side), so additions are locked.
+    """
+
+    def __init__(self) -> None:
+        self.records: list[dict] = []
+        self._lock = threading.Lock()
+
+    def add(self, record: dict) -> None:
+        with self._lock:
+            self.records.append(dict(record))
+
+    def summary(self) -> dict:
+        with self._lock:
+            records = list(self.records)
+        total = {"input": 0, "output": 0, "cached": 0, "cache_write": 0, "calls": 0}
+        steps: dict[str, dict] = {}
+        for r in records:
+            step = steps.setdefault(r["step"], {"input": 0, "output": 0, "cached": 0, "calls": 0})
+            for key in ("input", "output", "cached", "calls"):
+                step[key] += r.get(key, 0)
+            for key in total:
+                total[key] += r.get(key, 0)
+        models = sorted({f"{r['provider']}:{r['model']}" for r in records if r.get("model")})
+        return {**total, "steps": steps, "models": models}
 
 
 def _strings(values, limit: int) -> list[str]:
@@ -292,17 +368,24 @@ class Team:
                                  if settings.fast_model else self.chat)
         self.retriever = retriever or Retriever(settings)
         self.sources = Sources()
+        self.meter = Meter()
+        for model in {id(self.chat): self.chat, id(self.helper): self.helper}.values():
+            model.meter = self.meter.add
+        embedder = getattr(self.retriever, "embedder", None)
+        if embedder is not None:
+            embedder.meter = self.meter.add
 
     # -- plan ---------------------------------------------------------------- #
 
-    def plan(self, question: str, history: list[dict]) -> Plan:
+    def plan(self, question: str, history: list[dict], summary: str = "") -> Plan:
         conversation = "\n".join(
             f"{m['role']}: {m['content'][:500]}" for m in history[-4:]
         )
+        memory = f"Earlier in this conversation (summary):\n{summary}\n\n" if summary else ""
         data, ok = self.helper.structured(
             PLAN.replace("{variants}", str(self.settings.query_variants)),
-            f"Conversation so far:\n{conversation or '(none)'}\n\nQuestion: {question}",
-            fallback={},
+            f"{memory}Recent messages:\n{conversation or '(none)'}\n\nQuestion: {question}",
+            fallback={}, step="plan",
         )
         mode = str(data.get("mode") or "").strip().lower()
         standalone = str(data.get("standalone") or question).strip() or question
@@ -393,7 +476,7 @@ class Team:
         data, ok = self.helper.structured(
             GRADE.replace("{subquestions}", subquestions),
             f"Question: {plan.standalone}\n\nPASSAGES\n{listing}",
-            fallback={},
+            fallback={}, step="grade",
         )
         if not ok:
             # No grades: trust retrieval order, keep the top of it.
@@ -468,9 +551,12 @@ class Team:
         return ("SOURCES - excerpts from the student's own documents\n\n"
                 + Sources.format(numbered, compact=True))
 
-    def brief(self, plan: Plan, missing: list[str]) -> str:
+    def brief(self, plan: Plan, missing: list[str], summary: str = "") -> str:
         """The writer's user message: the question plus what it must know."""
-        parts = [f"Question: {plan.question}"]
+        parts = []
+        if summary:
+            parts.append(f"Earlier in this conversation (summary, not evidence):\n{summary}")
+        parts.append(f"Question: {plan.question}")
         if plan.standalone != plan.question:
             parts.append(f"(In full: {plan.standalone})")
         case = self.case_text(plan.case)
@@ -484,7 +570,8 @@ class Team:
         return "\n\n".join(parts)
 
     def write_system(self, mode: str) -> str:
-        return WRITE.replace("{mode_guidance}", MODE_GUIDANCE.get(mode, MODE_GUIDANCE["concept"]))
+        return (WRITE.replace("{profile}", profile_text(self.settings))
+                .replace("{mode_guidance}", MODE_GUIDANCE.get(mode, MODE_GUIDANCE["concept"])))
 
     def verify(self, answer: str, evidence: str) -> list[dict]:
         """Issues with the answer: figures first (free), then one model check."""
@@ -496,6 +583,7 @@ class Team:
                 "\n".join(f"- {', '.join(f['figures'])} in: {f['sentence']}" for f in figures)
         data, ok = self.helper.structured(
             VERIFY, f"ANSWER TO CHECK\n{answer}{hints}", fallback={}, context=evidence,
+            step="verify",
         )
         issues = [
             {k: str(i.get(k) or "").strip() for k in ("quote", "problem", "fix")}
@@ -510,13 +598,27 @@ class Team:
         )
         return self.chat.complete(
             REPAIR, f"ANSWER\n{answer}\n\nISSUES\n{listing}", context=evidence,
+            step="repair",
         )
 
     def suggest(self, question: str, answer: str) -> list[str]:
         data, ok = self.helper.structured(
             SUGGEST, f"Question: {question}\n\nAnswer:\n{answer[:3000]}", fallback={},
+            step="suggest",
         )
         return _strings(data.get("questions"), 3) if ok else []
+
+
+def update_memory(chat: ChatModel, summary: str, turns: list[dict]) -> str:
+    """Fold older turns into a chat's running summary (one cheap call)."""
+    transcript = "\n\n".join(
+        f"{t['role']}: {CITATION.sub('', t['content'])[:1800]}" for t in turns
+    )
+    return chat.complete(
+        MEMORY,
+        f"CURRENT SUMMARY\n{summary or '(none yet)'}\n\nNEW TURNS\n{transcript}",
+        effort="low", step="memory",
+    )
 
 
 def _merge_runs(chosen: dict[int, Passage], strength: dict[int, float]) -> list[Passage]:
@@ -560,4 +662,6 @@ def _join(run: list[Passage]) -> Passage:
         page_start=min(p.page_start for p in run), page_end=max(p.page_end for p in run),
         filename=first.filename, year=first.year, score=first.score,
         signals=first.signals, document_id=first.document_id,
+        line_start=first.line_start, line_end=run[-1].line_end,
+        title=first.title, author=first.author,
     )

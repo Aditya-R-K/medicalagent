@@ -50,7 +50,19 @@ class Pipeline:
         self.settings = settings
         self.team = Team(settings, chat, retriever)
 
-    def answer(self, question: str, history: list[dict] | None = None) -> Iterator[dict]:
+    def _usage(self) -> dict:
+        """Token use so far, for the live counter in the interface."""
+        return {"type": "usage", **self.team.meter.summary()}
+
+    def _finish(self, result: Consultation) -> dict:
+        result.usage = self.team.meter.summary()
+        result.records = list(self.team.meter.records)
+        return {"type": "complete", "result": result}
+
+    def answer(self, question: str, history: list[dict] | None = None,
+               summary: str = "") -> Iterator[dict]:
+        """`history` is the last few messages; `summary` covers everything
+        before them, so a long conversation costs no more than a short one."""
         # Earlier answers carry citation numbers from their own sources;
         # stripped, so the writer cannot reuse a [3] that now means another.
         history = [
@@ -63,7 +75,7 @@ class Pipeline:
         # -- plan ------------------------------------------------------------ #
         yield {"type": "status", "text": "Understanding the question"}
         try:
-            plan = team.plan(question, history)
+            plan = team.plan(question, history, summary)
         except Exception as exc:
             log.exception("planning failed")
             yield {"type": "error", "text": str(exc)}
@@ -71,6 +83,7 @@ class Pipeline:
         result.plan = plan
         yield {"type": "plan", "reading": plan.standalone, "mode": plan.mode,
                "subquestions": plan.subquestions}
+        yield self._usage()
 
         if plan.mode == "chat":
             yield from self._chat(question, history, result)
@@ -84,6 +97,7 @@ class Pipeline:
         result.candidates = len(candidates)
         yield {"type": "status", "text": f"Ranking {len(candidates)} passages"}
         graded, missing = team.grade(plan, candidates)
+        yield self._usage()
 
         # One corrective search, only for what grading found missing. Gaps are
         # found before writing, which is far cheaper than drafting, reviewing
@@ -114,12 +128,13 @@ class Pipeline:
         strength = evidence_strength(graded, missing)
         yield {"type": "evidence", "candidates": result.candidates, "sources": len(spans),
                "strength": strength, "missing": result.missing, "retried": result.retried}
+        yield self._usage()
 
         if not spans:
             yield {"type": "citations", "citations": []}
             yield {"type": "token", "text": NOTHING_FOUND}
             result.answer = NOTHING_FOUND
-            yield {"type": "complete", "result": result}
+            yield self._finish(result)
             return
 
         numbered = team.sources.register(spans)
@@ -131,8 +146,8 @@ class Pipeline:
         collected: list[str] = []
         try:
             for piece in team.chat.stream(
-                team.write_system(plan.mode), team.brief(plan, result.missing),
-                history[-4:], context=evidence,
+                team.write_system(plan.mode), team.brief(plan, result.missing, summary),
+                history[-4:], context=evidence, step="write",
             ):
                 collected.append(piece)
                 yield {"type": "token", "text": piece}
@@ -143,6 +158,7 @@ class Pipeline:
 
         raw = "".join(collected)
         answer = team.sources.sanitize(raw)
+        yield self._usage()
 
         # -- verify (and suggest, in parallel) ------------------------------ #
         check = self.settings.enable_review
@@ -186,18 +202,20 @@ class Pipeline:
         yield {"type": "citations", "citations": team.sources.cited(answer)}
         if result.suggestions:
             yield {"type": "suggestions", "questions": result.suggestions}
-        yield {"type": "complete", "result": result}
+        yield self._usage()
+        yield self._finish(result)
 
     def _chat(self, question: str, history: list[dict], result: Consultation) -> Iterator[dict]:
         """Greetings and thanks: a short reply, no documents, no citations."""
         yield {"type": "citations", "citations": []}
         collected: list[str] = []
         try:
-            for piece in self.team.chat.stream(CHAT, question, history[-4:]):
+            for piece in self.team.chat.stream(CHAT, question, history[-4:], step="chat"):
                 collected.append(piece)
                 yield {"type": "token", "text": piece}
         except Exception as exc:
             yield {"type": "error", "text": str(exc)}
             return
         result.answer = "".join(collected)
-        yield {"type": "complete", "result": result}
+        yield self._usage()
+        yield self._finish(result)

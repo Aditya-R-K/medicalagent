@@ -263,6 +263,20 @@ class ChatModel:
         self._send_json_mode = self.provider == "openai"
         self._send_effort = self.provider == "anthropic" and bool(
             CLAUDE_EFFORT_MODELS.match(self.model))
+        # Called with one usage record per call; set by whoever is counting.
+        self.meter = None
+
+    def _record(self, step: str, usage) -> None:
+        record = usage_record(self.provider, self.model, step, usage)
+        if record is None:
+            return
+        log.info("tokens %s %s in=%s out=%s cached=%s", step, self.name,
+                 record["input"], record["output"], record["cached"])
+        if self.meter:
+            try:
+                self.meter(record)
+            except Exception as exc:  # counting must never break an answer
+                log.info("usage meter failed: %s", exc)
 
     # ---------------------------------------------------------- message shapes
 
@@ -333,7 +347,7 @@ class ChatModel:
                 return getattr(self._claude_api(), method)(**arguments)
             raise
 
-    def _claude_check(self, message) -> None:
+    def _claude_check(self, message, step: str = "") -> None:
         if getattr(message, "stop_reason", None) == "refusal":
             details = getattr(message, "stop_details", None)
             category = getattr(details, "category", None) if details else None
@@ -342,7 +356,7 @@ class ChatModel:
                 + (f" ({category})" if category else "")
                 + ". Try rephrasing, or choose another model in Settings."
             )
-        _log_usage(self.name, getattr(message, "usage", None))
+        self._record(step, getattr(message, "usage", None))
 
     def _openai_arguments(self, messages: list[dict], **extra) -> dict:
         arguments = {"model": self.model, "messages": messages, **extra}
@@ -360,6 +374,9 @@ class ChatModel:
                 self._send_temperature = False
                 arguments.pop("temperature")
                 return self._create(**arguments)
+            if "stream_options" in text and "stream_options" in arguments:
+                arguments.pop("stream_options")
+                return self._create(**arguments)
             if "response_format" in text and "response_format" in arguments:
                 self._send_json_mode = False
                 arguments.pop("response_format")
@@ -376,14 +393,14 @@ class ChatModel:
 
     def complete(self, system: str, user: str, history: list[dict] | None = None,
                  json_only: bool = False, context: str | None = None,
-                 effort: str | None = None) -> str:
+                 effort: str | None = None, step: str = "call") -> str:
         """`effort` ("low" | "medium" | "high") applies to Claude models that
         support it; helper calls pass "low" to keep thinking short."""
         def call() -> str:
             if self.provider == "anthropic":
                 message = self._claude_call("create", self._claude_arguments(
                     system, user, history, 16000, context, effort))
-                self._claude_check(message)
+                self._claude_check(message, step)
                 return "".join(b.text for b in message.content if b.type == "text")
 
             messages = self._messages(system, user, history, context)
@@ -392,12 +409,13 @@ class ChatModel:
                 if json_only and self._send_json_mode:
                     arguments["response_format"] = {"type": "json_object"}
                 response = self._create(**arguments)
-                _log_usage(self.name, getattr(response, "usage", None))
+                self._record(step, getattr(response, "usage", None))
                 return response.choices[0].message.content or ""
             response = self._client.chat(
                 model=self.model, messages=messages, options=self._ollama_options(),
                 format="json" if json_only else "",
             )
+            self._record(step, response)
             return response["message"]["content"]
 
         try:
@@ -408,7 +426,8 @@ class ChatModel:
             raise ModelUnavailable(_unavailable_message(self.name)) from exc
 
     def stream(self, system: str, user: str, history: list[dict] | None = None,
-               context: str | None = None, effort: str | None = None) -> Iterator[str]:
+               context: str | None = None, effort: str | None = None,
+               step: str = "write") -> Iterator[str]:
         """Yield the reply in pieces, so the interface can render as it arrives."""
         try:
             if self.provider == "anthropic":
@@ -416,15 +435,16 @@ class ChatModel:
                         system, user, history, 32000, context, effort)) as stream:
                     for text in stream.text_stream:
                         yield text
-                    self._claude_check(stream.get_final_message())
+                    self._claude_check(stream.get_final_message(), step)
             elif self._compatible:
                 messages = self._messages(system, user, history, context)
                 arguments = self._openai_arguments(messages, stream=True)
-                if self.provider == "openai":
-                    arguments["stream_options"] = {"include_usage": True}
+                # Usage arrives in a final chunk when asked for; NVIDIA's NIM
+                # accepts the same option.
+                arguments["stream_options"] = {"include_usage": True}
                 for part in self._create(**arguments):
                     if getattr(part, "usage", None):
-                        _log_usage(self.name, part.usage)
+                        self._record(step, part.usage)
                     if part.choices and part.choices[0].delta.content:
                         yield part.choices[0].delta.content
             else:
@@ -436,6 +456,8 @@ class ChatModel:
                     piece = part.get("message", {}).get("content")
                     if piece:
                         yield piece
+                    if part.get("done"):
+                        self._record(step, part)
         except ProviderError:
             raise
         except Exception as exc:
@@ -446,7 +468,7 @@ class ChatModel:
             raise ProviderError(f"{self.name} stream failed: {exc}") from exc
 
     def structured(self, system: str, user: str, fallback: dict,
-                   context: str | None = None) -> tuple[dict, bool]:
+                   context: str | None = None, step: str = "call") -> tuple[dict, bool]:
         """Ask for JSON, falling back rather than failing when it cannot be parsed.
 
         A safety refusal also falls back: planning, grading and checking all
@@ -456,7 +478,7 @@ class ChatModel:
         try:
             reply = self.complete(
                 f"{system}\n\nReply with a single JSON object and nothing else.", user,
-                json_only=True, context=context, effort="low",
+                json_only=True, context=context, effort="low", step=step,
             )
         except SafetyRejection:
             log.warning("%s: helper call refused by content screening; using fallback",
@@ -480,23 +502,49 @@ def probe_chat(settings) -> None:
     for fast in ((False, True) if settings.fast_model else (False,)):
         model = ChatModel(settings, fast=fast)
         try:
-            model.complete("Reply with the single word OK.", "ping", effort="low")
+            model.complete("Reply with the single word OK.", "ping", effort="low",
+                           step="check")
         except SafetyRejection:
             continue
 
 
-def _log_usage(name: str, usage) -> None:
-    """Token use per call, so the cost of a question is visible in the log."""
+def _field(usage, *names):
+    for name in names:
+        value = usage.get(name) if isinstance(usage, dict) else getattr(usage, name, None)
+        if value:
+            return int(value)
+    return 0
+
+
+def usage_record(provider: str, model: str, step: str, usage) -> dict | None:
+    """One provider's usage report, normalised.
+
+    `input` is every prompt token, cached or not, so totals compare across
+    providers: OpenAI's prompt_tokens already includes cached tokens, while
+    Claude reports cache reads and writes separately from input_tokens.
+    """
     if usage is None:
-        return
-    fields = {
-        "in": getattr(usage, "input_tokens", None) or getattr(usage, "prompt_tokens", None),
-        "out": getattr(usage, "output_tokens", None) or getattr(usage, "completion_tokens", None),
-        "cache_read": getattr(usage, "cache_read_input_tokens", None)
-        or getattr(getattr(usage, "prompt_tokens_details", None), "cached_tokens", None),
-        "cache_write": getattr(usage, "cache_creation_input_tokens", None),
-    }
-    log.info("tokens %s %s", name, " ".join(f"{k}={v}" for k, v in fields.items() if v))
+        return None
+    if provider == "anthropic":
+        cached = _field(usage, "cache_read_input_tokens")
+        written = _field(usage, "cache_creation_input_tokens")
+        prompt = _field(usage, "input_tokens") + cached + written
+        output = _field(usage, "output_tokens")
+    elif provider == "ollama":
+        cached = written = 0
+        prompt = _field(usage, "prompt_eval_count")
+        output = _field(usage, "eval_count")
+    else:
+        details = usage.get("prompt_tokens_details") if isinstance(usage, dict) \
+            else getattr(usage, "prompt_tokens_details", None)
+        cached = _field(details, "cached_tokens") if details else 0
+        written = 0
+        prompt = _field(usage, "prompt_tokens", "input_tokens")
+        output = _field(usage, "completion_tokens", "output_tokens")
+    if not (prompt or output):
+        return None
+    return {"step": step, "provider": provider, "model": model, "input": prompt,
+            "output": output, "cached": cached, "cache_write": written, "calls": 1}
 
 
 # --------------------------------------------------------------------------- #
@@ -527,6 +575,7 @@ class EmbeddingModel:
         self.max_tokens = 8000
         # Passages the provider's content screening refused while indexing.
         self.rejected = 0
+        self.meter = None   # receives a usage record per embedding request
         self._client = _embed_client(settings)
 
     def embed(self, texts: Sequence[str], kind: str = "passage") -> list[list[float] | None]:
@@ -584,7 +633,8 @@ class EmbeddingModel:
     def _encode_uncached(self, batch: list[str], kind: str) -> list[list[float]]:
         vectors = _with_retries(
             lambda: raw_embed(self.settings, self._client, batch, kind,
-                              self.dim if self.settings.embed_send_dimensions else None),
+                              self.dim if self.settings.embed_send_dimensions else None,
+                              meter=self.meter),
             4, f"{self.name} embedding failed",
         )
         if vectors and self.dim and len(vectors[0]) != self.dim:
@@ -596,10 +646,15 @@ class EmbeddingModel:
 
 
 def raw_embed(settings, client, batch: list[str], kind: str,
-              dimensions: int | None) -> list[list[float]]:
+              dimensions: int | None, meter=None) -> list[list[float]]:
     provider = settings.embed_provider
+    step = "search" if kind == "query" else "index"
     if provider == "ollama":
         response = client.embed(model=settings.embed_model, input=batch)
+        if meter:
+            record = usage_record("ollama", settings.embed_model, step, response)
+            if record:
+                meter(record)
         return [list(v) for v in response["embeddings"]]
     arguments = {"model": settings.embed_model, "input": batch, "encoding_format": "float"}
     if dimensions:
@@ -609,6 +664,11 @@ def raw_embed(settings, client, batch: list[str], kind: str,
         # reject input past their window unless told to cut it.
         arguments["extra_body"] = {"input_type": kind, "truncate": "END"}
     response = client.embeddings.create(**arguments)
+    if meter:
+        record = usage_record(provider, settings.embed_model, step,
+                              getattr(response, "usage", None))
+        if record:
+            meter(record)
     return [item.embedding for item in response.data]
 
 

@@ -91,3 +91,34 @@ CREATE TABLE IF NOT EXISTS app_settings (
     value      TEXT NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- --------------------------------------------------------------------------
+-- Token accounting, conversation memory, exact reference locations.
+-- The backend also adds these at startup, for databases created earlier.
+-- --------------------------------------------------------------------------
+
+ALTER TABLE messages  ADD COLUMN IF NOT EXISTS usage JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE chats     ADD COLUMN IF NOT EXISTS summary TEXT NOT NULL DEFAULT '';
+ALTER TABLE chats     ADD COLUMN IF NOT EXISTS summarized_upto BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE chunks    ADD COLUMN IF NOT EXISTS line_start INTEGER;
+ALTER TABLE chunks    ADD COLUMN IF NOT EXISTS line_end INTEGER;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS title TEXT NOT NULL DEFAULT '';
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS author TEXT NOT NULL DEFAULT '';
+
+CREATE TABLE IF NOT EXISTS usage_events (
+    id                 BIGSERIAL PRIMARY KEY,
+    chat_id            BIGINT REFERENCES chats (id) ON DELETE SET NULL,
+    message_id         BIGINT REFERENCES messages (id) ON DELETE SET NULL,
+    document_id        BIGINT REFERENCES documents (id) ON DELETE SET NULL,
+    step               TEXT    NOT NULL,
+    provider           TEXT    NOT NULL DEFAULT '',
+    model              TEXT    NOT NULL DEFAULT '',
+    input_tokens       INTEGER NOT NULL DEFAULT 0,
+    output_tokens      INTEGER NOT NULL DEFAULT 0,
+    cached_tokens      INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    calls              INTEGER NOT NULL DEFAULT 1,
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS usage_events_created_idx ON usage_events (created_at);
+CREATE INDEX IF NOT EXISTS usage_events_chat_idx ON usage_events (chat_id);

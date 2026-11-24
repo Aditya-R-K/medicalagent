@@ -23,6 +23,11 @@
           Documents
           <span class="badge" id="doc-badge"></span>
         </button>
+        <button class="ghost" id="open-usage">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>
+          Token usage
+          <span class="badge muted" id="usage-badge"></span>
+        </button>
         <button class="ghost" id="open-settings-side">
           <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
           Settings
@@ -36,6 +41,7 @@
         <button class="icon-button" id="toggle-sidebar" aria-label="Toggle sidebar">
           <svg viewBox="0 0 24 24"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
         </button>
+        <button class="chat-tokens" id="chat-tokens" title="Tokens used in this chat" hidden></button>
         <h1 id="chat-title">AI Doctor</h1>
         <button class="model-chip" id="model-chip" title="Change model" hidden></button>
         <button class="icon-button" id="open-settings" aria-label="Settings" title="Settings">
@@ -80,12 +86,35 @@
           <span>PDF, TXT or MD — drag here or click to browse</span>
         </label>
 
+        <div class="upload-card" id="upload-card" hidden>
+          <div class="upload-top">
+            <strong id="upload-name"></strong>
+            <span id="upload-percent"></span>
+          </div>
+          <div class="bar"><div id="upload-bar"></div></div>
+          <div class="upload-meta" id="upload-meta"></div>
+        </div>
+
         <div class="panel-actions">
           <button class="primary" id="index-button">Index new documents</button>
           <button class="ghost" id="rebuild-button">Rebuild everything</button>
         </div>
 
         <div class="doc-list" id="doc-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="overlay" id="usage-panel" hidden>
+    <div class="panel usage">
+      <header class="panel-head">
+        <h2>Token usage</h2>
+        <button class="icon-button" id="close-usage" aria-label="Close">
+          <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+      </header>
+      <div class="panel-body" id="usage-body">
+        <p class="status-line">Loading…</p>
       </div>
     </div>
   </div>
@@ -102,6 +131,7 @@
       <nav class="settings-tabs" role="tablist">
         <button type="button" role="tab" data-tab="models" aria-selected="true">Models</button>
         <button type="button" role="tab" data-tab="keys" aria-selected="false">API keys</button>
+        <button type="button" role="tab" data-tab="profile" aria-selected="false">Study profile</button>
       </nav>
 
       <div class="panel-body">
@@ -216,6 +246,41 @@
             <input type="text" id="ollama-host" placeholder="http://host.docker.internal:11434">
             <p class="key-status" data-status-for="ollama"></p>
           </section>
+        </div>
+
+        <!-- ========================================================== profile -->
+        <div class="tab-pane" data-pane="profile" hidden>
+          <p class="hint top">Answers are pitched to you: the depth, what counts as high-yield, and how much detail. Facts still come only from your documents.</p>
+          <label class="field">
+            <span class="field-label">I am</span>
+            <select id="learner-level">
+              <option value="">Not set</option>
+              <option value="preclinical">MBBS, pre-clinical (years 1–2)</option>
+              <option value="clinical">MBBS, clinical (years 3–5)</option>
+              <option value="intern">Intern / junior resident</option>
+              <option value="pg">Postgraduate resident (MD/MS)</option>
+              <option value="phd">PhD / research student</option>
+            </select>
+          </label>
+          <label class="field">
+            <span class="field-label">Preparing for</span>
+            <input type="text" id="exam-target" list="exam-options" placeholder="e.g. NEET-PG, USMLE Step 1, university exams, thesis">
+            <datalist id="exam-options">
+              <option value="University professional exams">
+              <option value="NEET-PG"><option value="INI-CET"><option value="FMGE">
+              <option value="USMLE Step 1"><option value="USMLE Step 2 CK">
+              <option value="PLAB"><option value="MRCP"><option value="MRCS">
+              <option value="PhD thesis / research">
+            </datalist>
+          </label>
+          <div class="field">
+            <span class="field-label">Answer length</span>
+            <div class="segmented three" id="answer-length" role="radiogroup">
+              <button type="button" data-length="concise">Concise</button>
+              <button type="button" data-length="">Standard</button>
+              <button type="button" data-length="detailed">Detailed</button>
+            </div>
+          </div>
         </div>
 
         <p class="settings-message" id="settings-message" role="status"></p>

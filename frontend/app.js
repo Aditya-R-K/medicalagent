@@ -124,33 +124,108 @@ function renderMarkdown(text) {
     .join('');
 }
 
+/* References: the book, the exact page and lines, the passage itself, a link
+   that opens the PDF at that page, and a Vancouver-style reference to copy. */
 function renderSources(citations) {
   if (!citations || !citations.length) return '';
   const items = citations
-    .map(
-      (c) => `
+    .map((c) => {
+      const title = c.title || c.source;
+      const byline = [c.author, c.year].filter(Boolean).join(', ');
+      const where = c.location || pageLabel(c);
+      const isPdf = /\.pdf$/i.test(c.source || '');
+      const open = c.document_id
+        ? `<a class="ref-action" href="/api/documents/${c.document_id}/file${isPdf ? `#page=${c.page_start}` : ''}"
+              target="_blank" rel="noopener">Open ${isPdf ? `PDF at p. ${c.page_start}` : 'document'}</a>`
+        : '';
+      const reference = c.vancouver || `${title}${c.year ? `. ${c.year}` : ''}. ${pageLabel(c)}.`;
+      return `
       <div class="source" data-source="${c.index}">
         <div class="source-head">
           <span class="source-index">${c.index}</span>
-          <span class="source-name">${escapeHtml(c.source)}</span>
-          <span class="source-page">${escapeHtml(c.pages || pageLabel(c))}</span>
+          <span class="source-name"><strong>${escapeHtml(title)}</strong>${
+            byline ? ` <span class="byline">· ${escapeHtml(byline)}</span>` : ''}</span>
+          <span class="source-page">${escapeHtml(where)}</span>
         </div>
-        <div class="source-body" hidden>${escapeHtml(c.excerpt || '')}</div>
-      </div>`)
+        <div class="source-body" hidden>
+          ${c.section ? `<div class="source-section">${escapeHtml(c.section)}</div>` : ''}
+          <blockquote>${escapeHtml(c.excerpt || '')}</blockquote>
+          <div class="source-actions">
+            ${open}
+            <button class="ref-action copy-ref" type="button" data-ref="${escapeHtml(reference)}">Copy reference</button>
+            <span class="source-file">${escapeHtml(c.source || '')}</span>
+          </div>
+        </div>
+      </div>`;
+    })
     .join('');
-  return `<div class="sources"><div class="sources-head">Sources</div>${items}</div>`;
+  const all = citations
+    .map((c) => `${c.index}. ${c.vancouver || `${c.title || c.source}. ${c.location || pageLabel(c)}.`}`)
+    .join('\n');
+  return `<div class="sources">
+      <div class="sources-head"><span>References</span>
+        <button class="ref-action copy-ref" type="button" data-ref="${escapeHtml(all)}">Copy all</button>
+      </div>${items}</div>`;
 }
 
 const pageLabel = (c) =>
-  c.page_start === c.page_end ? `p.${c.page_start}` : `pp.${c.page_start}-${c.page_end}`;
+  c.page_start === c.page_end ? `p. ${c.page_start}` : `pp. ${c.page_start}-${c.page_end}`;
 
-function messageElement(role, html, citations) {
+/* ---------------------------------------------------------------- tokens */
+
+const fmtTokens = (n) => {
+  n = Number(n) || 0;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(n >= 1e7 ? 0 : 1)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(n >= 1e4 ? 0 : 1)}k`;
+  return String(n);
+};
+const STEP_LABEL = {
+  plan: 'Planning', search: 'Search embeddings', grade: 'Ranking passages',
+  write: 'Writing the answer', verify: 'Fact-check', repair: 'Correction',
+  suggest: 'Follow-up questions', chat: 'Chat reply', memory: 'Conversation memory',
+  index: 'Indexing documents', check: 'Model check', call: 'Other',
+};
+
+/* One line under an answer: total, in/out, cache, calls; steps on click. */
+function usageLine(usage, { live = false } = {}) {
+  if (!usage || !(usage.input || usage.output)) return '';
+  const total = (usage.input || 0) + (usage.output || 0);
+  const cached = usage.cached ? ` <span class="cached">(${fmtTokens(usage.cached)} cached)</span>` : '';
+  const steps = Object.entries(usage.steps || {})
+    .sort((a, b) => (b[1].input + b[1].output) - (a[1].input + a[1].output))
+    .map(([step, u]) => `<tr><td>${escapeHtml(STEP_LABEL[step] || step)}</td>
+        <td>${fmtTokens(u.input)}</td><td>${fmtTokens(u.output)}</td>
+        <td>${u.cached ? fmtTokens(u.cached) : '—'}</td><td>${u.calls}</td></tr>`)
+    .join('');
+  return `<details class="usage-line${live ? ' live' : ''}">
+      <summary><span class="usage-total">${live ? '~' : ''}${fmtTokens(total)} tokens</span>
+        <span class="sep">·</span>${fmtTokens(usage.input)} in${cached}
+        <span class="sep">·</span>${live ? '~' : ''}${fmtTokens(usage.output)} out
+        <span class="sep">·</span>${usage.calls || 0} call${usage.calls === 1 ? '' : 's'}</summary>
+      ${steps ? `<table class="usage-steps"><thead><tr><th>Step</th><th>In</th><th>Out</th>
+        <th>Cached</th><th>Calls</th></tr></thead><tbody>${steps}</tbody></table>` : ''}
+    </details>`;
+}
+
+function setChatTokens(usage) {
+  const chip = $('chat-tokens');
+  const total = usage ? (Number(usage.input) || 0) + (Number(usage.output) || 0) : 0;
+  state.chatUsage = usage || null;
+  if (!total) { chip.hidden = true; return; }
+  chip.hidden = false;
+  chip.innerHTML = `<span class="sigma">Σ</span> ${fmtTokens(total)} <span class="unit">tokens</span>`;
+  chip.title = `This chat: ${Number(usage.input || 0).toLocaleString()} input ` +
+    `(${Number(usage.cached || 0).toLocaleString()} cached) · ` +
+    `${Number(usage.output || 0).toLocaleString()} output · ${usage.calls || 0} model calls`;
+}
+
+function messageElement(role, html, citations, usage) {
   const turn = document.createElement('div');
   turn.className = `turn ${role}`;
   turn.innerHTML =
     role === 'user'
       ? `<div class="bubble">${html}</div>`
-      : `<div class="answer">${html}</div>${renderSources(citations)}`;
+      : `<div class="answer">${html}</div>${renderSources(citations)}${usageLine(usage)}`;
   return turn;
 }
 
@@ -171,6 +246,7 @@ async function loadChats() {
     const item = document.createElement('div');
     item.className = `chat-item${chat.id === state.chatId ? ' active' : ''}`;
     item.innerHTML = `<span>${escapeHtml(chat.title)}</span>
+      ${Number(chat.tokens) ? `<small class="chat-item-tokens">${fmtTokens(chat.tokens)}</small>` : ''}
       <button class="delete icon-button" title="Delete">
         <svg viewBox="0 0 24 24"><path d="M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13"/></svg>
       </button>`;
@@ -192,6 +268,7 @@ async function loadChats() {
 function showEmptyState() {
   $('messages').innerHTML = '';
   $('chat-title').textContent = 'AI Doctor';
+  setChatTokens(null);
   const empty = document.createElement('div');
   empty.className = 'empty';
   empty.innerHTML = `
@@ -206,7 +283,11 @@ async function openChat(chatId) {
   const chat = state.chats.find((c) => c.id === chatId);
   $('chat-title').textContent = chat ? chat.title : 'Chat';
 
-  const { messages } = await api.get(`/chats/${chatId}/messages`);
+  const [{ messages }, usage] = await Promise.all([
+    api.get(`/chats/${chatId}/messages`),
+    api.get(`/chats/${chatId}/usage`).catch(() => null),
+  ]);
+  setChatTokens(usage);
   const box = $('messages');
   box.innerHTML = '';
   messages.forEach((message) => {
@@ -214,7 +295,7 @@ async function openChat(chatId) {
       message.role === 'user'
         ? escapeHtml(message.content)
         : renderMarkdown(message.content);
-    box.appendChild(messageElement(message.role, html, message.citations));
+    box.appendChild(messageElement(message.role, html, message.citations, message.usage));
   });
   scrollDown();
   loadChats();
@@ -258,6 +339,28 @@ async function ask(question) {
   let answer = '';
   let citations = [];
   const trace = { plan: null, reasoning: null, evidence: null, verify: null, suggestions: [] };
+
+  // Token counter: exact totals arrive after each step; while the answer
+  // streams, output tokens are estimated (~4 characters a token) until the
+  // exact count lands.
+  let usage = null;
+  let streamedSince = 0;
+  const chatBefore = state.chatUsage ? { ...state.chatUsage } : null;
+  const liveUsage = () => {
+    const base = usage || { input: 0, output: 0, cached: 0, calls: 0, steps: {} };
+    const estimate = Math.round(streamedSince / 4);
+    return estimate ? { ...base, output: (base.output || 0) + estimate } : base;
+  };
+  const showLiveTotals = () => {
+    const now = liveUsage();
+    const before = chatBefore || { input: 0, output: 0, cached: 0, calls: 0 };
+    setChatTokens({
+      input: (Number(before.input) || 0) + (now.input || 0),
+      output: (Number(before.output) || 0) + (now.output || 0),
+      cached: (Number(before.cached) || 0) + (now.cached || 0),
+      calls: (Number(before.calls) || 0) + (now.calls || 0),
+    });
+  };
 
   const traceHtml = () => {
     if (!trace.plan || trace.plan.mode === 'chat') return '';
@@ -343,8 +446,14 @@ async function ask(question) {
 
         if (event.type === 'status') {
           turn.innerHTML = traceHtml() +
-            `<div class="status"><span class="dot"></span><span>${escapeHtml(event.text)}</span></div>`;
+            `<div class="status"><span class="dot"></span><span>${escapeHtml(event.text)}</span></div>` +
+            usageLine(liveUsage(), { live: true });
           scrollDown();
+        } else if (event.type === 'usage') {
+          // Exact counts after each step; the estimate restarts from here.
+          usage = event;
+          streamedSince = 0;
+          showLiveTotals();
         } else if (event.type === 'plan') {
           trace.plan = event;
         } else if (event.type === 'reasoning') {
@@ -357,7 +466,10 @@ async function ask(question) {
           citations = event.citations;
         } else if (event.type === 'token') {
           answer += event.text;
-          turn.innerHTML = traceHtml() + `<div class="answer">${renderMarkdown(answer)}</div>`;
+          streamedSince += event.text.length;
+          turn.innerHTML = traceHtml() + `<div class="answer">${renderMarkdown(answer)}</div>` +
+            usageLine(liveUsage(), { live: true });
+          showLiveTotals();
           scrollDown();
         } else if (event.type === 'answer') {
           // The backend stripped citation markers that pointed at nothing.
@@ -368,9 +480,13 @@ async function ask(question) {
           turn.innerHTML = traceHtml() + `<div class="error">${escapeHtml(event.text)}</div>`;
         } else if (event.type === 'done') {
           state.streaming = false; // collapses the trace in the final render
+          if (event.usage) usage = event.usage;
+          streamedSince = 0;
           turn.innerHTML = traceHtml() +
             `<div class="answer">${renderMarkdown(answer)}</div>${renderSources(citations)}` +
-            chipsHtml();
+            usageLine(usage) + chipsHtml();
+          if (event.chat_usage) setChatTokens(event.chat_usage);
+          refreshUsageBadge();
         }
       }
     }
@@ -403,11 +519,13 @@ async function loadDocuments() {
     row.className = 'doc';
     const percent = Math.round((doc.progress || 0) * 100);
     const excluded = doc.status === 'excluded';
+    const indexingNow = doc.status === 'indexing';
     row.innerHTML = `
       <div class="doc-top">
-        <span class="doc-name">${escapeHtml(doc.filename)}</span>
+        <span class="doc-name" title="${escapeHtml(doc.filename)}">${escapeHtml(doc.title || doc.filename)}</span>
         <span class="pill ${doc.status}">${doc.status}</span>
-        <button class="row-action">${excluded ? 'Include' : 'Remove from index'}</button>
+        <button class="row-action">${excluded ? 'Include' : 'Exclude'}</button>
+        <button class="row-action danger delete-doc" ${indexingNow ? 'disabled title="Wait for indexing to finish"' : ''}>Delete</button>
       </div>
       <div class="doc-meta">
         ${doc.pages || 0} pages · ${(doc.size_bytes / 1e6).toFixed(1)} MB
@@ -417,13 +535,26 @@ async function loadDocuments() {
       ${doc.status === 'indexing' ? `<div class="bar"><div style="width:${percent}%"></div></div>` : ''}
       ${doc.error ? `<div class="doc-error">${escapeHtml(doc.error)}</div>` : ''}`;
     row.querySelector('.row-action').onclick = async () => {
-      // Never deletes the file. To remove a document entirely, delete it from
-      // the knowledgebase folder yourself.
+      // Excluding keeps the file and its passages; it only stops searching them.
       if (!excluded && !confirm(
-        `Remove "${doc.filename}" from the search index?\n\n` +
-        `The file stays in your knowledgebase folder — this only drops it from ` +
-        `search results. You can include it again at any time.`)) return;
+        `Exclude "${doc.filename}" from search?\n\n` +
+        `The file and its index stay - answers just stop drawing on it. ` +
+        `You can include it again at any time, at no cost.`)) return;
       await api.post(`/documents/${doc.id}/${excluded ? 'include' : 'exclude'}`);
+      loadDocuments();
+      loadSettings();
+    };
+    row.querySelector('.delete-doc').onclick = async () => {
+      const passages = doc.chunk_count ? ` and its ${doc.chunk_count.toLocaleString()} indexed passages` : '';
+      if (!confirm(
+        `Delete "${doc.filename}" permanently?\n\n` +
+        `This deletes the file from your knowledgebase folder${passages}. ` +
+        `It cannot be undone - you would need to upload and index it again.`)) return;
+      try {
+        await api.remove(`/documents/${doc.id}`);
+      } catch (error) {
+        alert(`Could not delete: ${error.message}`);
+      }
       loadDocuments();
       loadSettings();
     };
@@ -444,17 +575,73 @@ async function loadDocuments() {
   state.wasIndexing = busy;
 }
 
-async function uploadFiles(files) {
-  if (!files.length) return;
+const fmtBytes = (n) =>
+  n >= 1e9 ? `${(n / 1e9).toFixed(2)} GB` : n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB`
+    : `${Math.max(1, Math.round(n / 1e3))} KB`;
+const fmtSeconds = (s) =>
+  !Number.isFinite(s) ? '' : s >= 90 ? `${Math.round(s / 60)} min left` : `${Math.max(1, Math.round(s))} s left`;
+
+/* Upload with a real progress bar. fetch() cannot report upload progress, so
+   this uses XMLHttpRequest: bytes sent, speed, time left, then a "processing"
+   phase while the server saves the file and reads its pages. */
+function uploadFiles(files) {
+  files = Array.from(files || []);
+  if (!files.length || state.uploading) return;
+  const total = files.reduce((sum, f) => sum + f.size, 0);
+  const name = files.length === 1 ? files[0].name : `${files.length} files`;
+  const card = $('upload-card');
+  const show = (percent, meta, phase = '') => {
+    card.hidden = false;
+    card.className = `upload-card ${phase}`;
+    $('upload-name').textContent = name;
+    $('upload-percent').textContent = phase === 'error' ? 'Failed'
+      : phase === 'processing' ? 'Processing…' : phase === 'done' ? 'Done' : `${percent}%`;
+    $('upload-bar').style.width = `${percent}%`;
+    $('upload-meta').textContent = meta;
+  };
+
   const form = new FormData();
-  Array.from(files).forEach((file) => form.append('files', file));
-  $('dropzone').classList.add('over');
-  try {
-    await fetch('/api/documents', { method: 'POST', body: form });
-    await loadDocuments();
-  } finally {
-    $('dropzone').classList.remove('over');
-  }
+  files.forEach((file) => form.append('files', file));
+  const xhr = new XMLHttpRequest();
+  const started = performance.now();
+  state.uploading = true;
+  $('dropzone').classList.add('busy');
+  show(0, `0 of ${fmtBytes(total)}`);
+
+  xhr.upload.onprogress = (event) => {
+    if (!event.lengthComputable) return;
+    const seconds = (performance.now() - started) / 1000;
+    const speed = event.loaded / Math.max(seconds, 0.001);
+    const percent = Math.min(100, Math.round((event.loaded / event.total) * 100));
+    show(percent, `${fmtBytes(event.loaded)} of ${fmtBytes(event.total)} · ` +
+      `${fmtBytes(speed)}/s · ${fmtSeconds((event.total - event.loaded) / speed)}`);
+  };
+  xhr.upload.onload = () =>
+    show(100, 'Uploaded. Saving and reading the pages - large PDFs take a moment.', 'processing');
+
+  const finish = () => {
+    state.uploading = false;
+    $('dropzone').classList.remove('busy');
+    $('file-input').value = '';
+  };
+  xhr.onload = () => {
+    finish();
+    if (xhr.status >= 200 && xhr.status < 300) {
+      show(100, `${name} added. Press "Index new documents" to make it searchable.`, 'done');
+      setTimeout(() => { if (!state.uploading) card.hidden = true; }, 6000);
+    } else {
+      let detail = xhr.statusText;
+      try { detail = JSON.parse(xhr.responseText).detail || detail; } catch { /* not JSON */ }
+      show(100, `Upload failed: ${detail}`, 'error');
+    }
+    loadDocuments();
+  };
+  xhr.onerror = () => {
+    finish();
+    show(0, 'Upload failed: the connection was interrupted.', 'error');
+  };
+  xhr.open('POST', '/api/documents');
+  xhr.send(form);
 }
 
 /* -------------------------------------------------------------- settings */
@@ -765,10 +952,25 @@ async function testProvider(provider) {
 
 /* ------------------------------------------------------------ open & save */
 
+function renderProfile(profile = {}) {
+  $('learner-level').value = profile.learner_level || '';
+  $('exam-target').value = profile.exam_target || '';
+  setAnswerLength(profile.answer_length || '');
+}
+
+function setAnswerLength(value) {
+  document.querySelectorAll('#answer-length button').forEach((b) =>
+    b.setAttribute('aria-checked', String(b.dataset.length === value)));
+}
+
+const answerLength = () =>
+  document.querySelector('#answer-length button[aria-checked="true"]')?.dataset.length || '';
+
 function applyConfig(config, { keepSelection = false } = {}) {
   settingsUi.config = config;
   renderKeys(config);
   renderIndexCard();
+  renderProfile(config.profile);
   document.querySelectorAll('#chat-providers button').forEach((b) =>
     b.classList.toggle('active-provider', b.dataset.provider === config.llm_provider));
   document.querySelectorAll('#embed-providers button').forEach((b) =>
@@ -825,6 +1027,9 @@ async function saveSettings() {
     nvidia_base_url: $('nvidia-base').value.trim(),
     nvidia_embed_base_url: $('nvidia-embed-base').value.trim(),
     ollama_host: $('ollama-host').value.trim(),
+    learner_level: $('learner-level').value,
+    exam_target: $('exam-target').value.trim(),
+    answer_length: answerLength(),
   };
   ['openai', 'anthropic', 'nvidia'].forEach((p) => {
     const key = $(`${p}-key`).value.trim();
@@ -945,6 +1150,95 @@ function showModelChip(llm) {
   chip.hidden = false;
 }
 
+/* ----------------------------------------------------------------- usage */
+
+const shortDay = (iso) =>
+  new Date(`${iso}T00:00:00`).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+const sumTokens = (u) => (Number(u?.input) || 0) + (Number(u?.output) || 0);
+
+async function refreshUsageBadge() {
+  try {
+    const report = await api.get('/usage?days=1');
+    const today = sumTokens(report.today);
+    $('usage-badge').textContent = today ? `${fmtTokens(today)} today` : '';
+  } catch { /* the badge is a nicety */ }
+}
+
+function statTile(label, u, note = '') {
+  return `<div class="stat">
+      <div class="stat-label">${label}</div>
+      <div class="stat-value">${fmtTokens(sumTokens(u))}</div>
+      <div class="stat-note">${note || `${fmtTokens(u.input)} in · ${fmtTokens(u.output)} out · ${Number(u.calls || 0).toLocaleString()} calls`}</div>
+    </div>`;
+}
+
+/* One series, one hue: total tokens per day. Thin bars anchored to the
+   baseline, a hover tooltip per bar, and the tables below as the text view. */
+function dailyChart(days) {
+  const peak = Math.max(1, ...days.map(sumTokens));
+  const bars = days.map((d, i) => {
+    const total = sumTokens(d);
+    const height = total ? Math.max(2, (total / peak) * 100) : 0;
+    const label = i % 2 === (days.length - 1) % 2 ? shortDay(d.day) : '';
+    return `<div class="bar-col" tabindex="0" aria-label="${shortDay(d.day)}: ${total.toLocaleString()} tokens">
+        <div class="bar-fill" style="height:${height}%"></div>
+        <div class="bar-tip"><strong>${shortDay(d.day)}</strong>${total.toLocaleString()} tokens
+          <span>${fmtTokens(d.input)} in · ${fmtTokens(d.output)} out${Number(d.cached) ? ` · ${fmtTokens(d.cached)} cached` : ''}</span></div>
+        <span class="bar-label">${label}</span>
+      </div>`;
+  }).join('');
+  return `<div class="chart" role="img" aria-label="Tokens per day for the last ${days.length} days">
+      <div class="chart-top"><span>Tokens per day</span><span class="chart-peak">peak ${fmtTokens(peak)}</span></div>
+      <div class="chart-plot">${bars}</div>
+    </div>`;
+}
+
+function usageTable(title, rows, nameOf, extra = () => '') {
+  if (!rows.length) return '';
+  const body = rows.map((r) => `<tr>
+      <td class="name">${nameOf(r)}</td><td>${fmtTokens(r.input)}</td><td>${fmtTokens(r.output)}</td>
+      <td>${Number(r.cached) ? fmtTokens(r.cached) : '—'}</td><td>${Number(r.calls).toLocaleString()}</td>${extra(r)}
+    </tr>`).join('');
+  return `<section class="usage-section"><h3>${title}</h3>
+      <table class="usage-table"><thead><tr><th></th><th>In</th><th>Out</th><th>Cached</th><th>Calls</th></tr></thead>
+      <tbody>${body}</tbody></table></section>`;
+}
+
+async function openUsage() {
+  $('usage-panel').hidden = false;
+  const body = $('usage-body');
+  body.innerHTML = '<p class="status-line">Loading…</p>';
+  try {
+    const r = await api.get('/usage?days=14');
+    const all = r.all_time;
+    const cacheShare = Number(all.input) ? Math.round((Number(all.cached) / Number(all.input)) * 100) : 0;
+    if (!sumTokens(all)) {
+      body.innerHTML = '<p class="status-line">No tokens used yet. Ask a question or index a document and the numbers appear here.</p>';
+      return;
+    }
+    body.innerHTML = `
+      <div class="stats">
+        ${statTile('Today', r.today)}
+        ${statTile('Last 7 days', r.week)}
+        ${statTile('All time', all)}
+        ${statTile('Served from cache', { input: all.cached, output: 0 },
+          `${cacheShare}% of input tokens, billed at a discount`)}
+      </div>
+      ${dailyChart(r.daily)}
+      <div class="usage-split">
+        ${statTile('Answering questions', r.chats)}
+        ${statTile('Indexing documents', r.indexing, `${fmtTokens(r.indexing.input)} embedded · one-time cost`)}
+      </div>
+      ${usageTable('By step', r.by_step, (s) => escapeHtml(STEP_LABEL[s.step] || s.step))}
+      ${usageTable('By model', r.by_model, (m) => `${escapeHtml(PROVIDERS[m.provider]?.label || m.provider)} · ${escapeHtml(m.model)}`)}
+      ${usageTable('Chats using the most', r.top_chats,
+        (c) => c.chat_id ? `<a href="#" class="open-chat" data-chat="${c.chat_id}">${escapeHtml(c.title)}</a>` : escapeHtml(c.title))}
+      <p class="hint">Input counts every prompt token, including those served from the provider's cache. Long chats stay cheap: older messages are folded into a short running summary instead of being resent.</p>`;
+  } catch (error) {
+    body.innerHTML = `<p class="error">Could not load usage: ${escapeHtml(error.message)}</p>`;
+  }
+}
+
 /* ------------------------------------------------------------------ init */
 
 async function loadSettings() {
@@ -1017,6 +1311,23 @@ function wireEvents() {
   };
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape' && !$('documents-panel').hidden) $('close-documents').click();
+    if (event.key === 'Escape' && !$('usage-panel').hidden) $('usage-panel').hidden = true;
+  });
+
+  $('open-usage').onclick = openUsage;
+  $('chat-tokens').onclick = openUsage;
+  $('close-usage').onclick = () => { $('usage-panel').hidden = true; };
+  $('usage-panel').onclick = (event) => {
+    if (event.target === $('usage-panel')) $('usage-panel').hidden = true;
+    const link = event.target.closest('.open-chat');
+    if (link) {
+      event.preventDefault();
+      $('usage-panel').hidden = true;
+      openChat(Number(link.dataset.chat));
+    }
+  };
+  document.querySelectorAll('#answer-length button').forEach((b) => {
+    b.onclick = () => setAnswerLength(b.dataset.length);
   });
 
   $('dropzone').onclick = () => $('file-input').click();
@@ -1045,6 +1356,17 @@ function wireEvents() {
 
   // Citation chips, follow-up chips, and source cards.
   document.addEventListener('click', (event) => {
+    const copy = event.target.closest('.copy-ref');
+    if (copy) {
+      event.stopPropagation();
+      navigator.clipboard?.writeText(copy.dataset.ref).then(() => {
+        const label = copy.textContent;
+        copy.textContent = 'Copied ✓';
+        setTimeout(() => { copy.textContent = label; }, 1400);
+      }).catch(() => window.prompt('Copy this reference:', copy.dataset.ref));
+      return;
+    }
+    if (event.target.closest('.ref-action')) return; // links open on their own
     const followUp = event.target.closest('.chip');
     if (followUp) {
       ask(followUp.textContent);
@@ -1092,7 +1414,9 @@ async function start() {
   wireSettings();
   showEmptyState();
   // Settled, not all-or-nothing: one failing call must not leave the page blank.
-  const results = await Promise.allSettled([loadChats(), loadSettings(), loadDocuments()]);
+  const results = await Promise.allSettled([
+    loadChats(), loadSettings(), loadDocuments(), refreshUsageBadge(),
+  ]);
   results
     .filter((r) => r.status === 'rejected')
     .forEach((r) => reportFailure(r.reason?.message || String(r.reason)));

@@ -6,20 +6,22 @@ import asyncio
 import json
 import logging
 import shutil
+import threading
 from dataclasses import replace
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from . import config, db, ingest, store
 from .pipeline import Pipeline
 from .providers import (
-    ProviderError, available_models, list_models, probe_chat, probe_embedding,
+    ChatModel, ProviderError, available_models, list_models, probe_chat, probe_embedding,
 )
+from .team import update_memory
 
 logging.basicConfig(
     level=logging.INFO,
@@ -83,6 +85,9 @@ class ConfigUpdate(BaseModel):
     anthropic_fast_model: str | None = Field(None, max_length=200)
     nvidia_fast_model: str | None = Field(None, max_length=200)
     ollama_fast_model: str | None = Field(None, max_length=200)
+    learner_level: str | None = Field(None, max_length=40)
+    exam_target: str | None = Field(None, max_length=120)
+    answer_length: str | None = Field(None, max_length=20)
 
 
 class ModelQuery(BaseModel):
@@ -223,6 +228,11 @@ def read_config() -> dict:
             "passages": indexed["passages"],
             "indexing": ingest.is_running(),
         },
+        "profile": {
+            "learner_level": settings.learner_level,
+            "exam_target": settings.exam_target,
+            "answer_length": settings.answer_length,
+        },
         "problems": settings.problems(),
     }
 
@@ -350,6 +360,51 @@ async def upload_documents(files: list[UploadFile]) -> dict:
     return {"saved": saved}
 
 
+def _document_path(record: dict) -> Path:
+    """The document's file, refusing anything that resolves outside the folder."""
+    root = settings.document_root.resolve()
+    path = (root / record["filename"]).resolve()
+    if root not in path.parents:
+        raise HTTPException(400, "document path is outside the knowledgebase folder")
+    return path
+
+
+@app.delete("/api/documents/{document_id}")
+def delete_document(document_id: int) -> dict:
+    """Delete a document for good: the file in the knowledgebase folder, its
+    passages and its index entries. The interface asks for confirmation first;
+    to keep the file but stop searching it, exclude it instead."""
+    record = db.query_one("SELECT * FROM documents WHERE id = %s", (document_id,))
+    if not record:
+        raise HTTPException(404, "no such document")
+    if record["status"] == "indexing":
+        raise HTTPException(409, "This document is being indexed. Wait for it to finish, "
+                                 "then delete it.")
+    path = _document_path(record)
+    try:
+        if path.exists():
+            path.unlink()
+    except OSError as exc:
+        raise HTTPException(500, f"could not delete the file: {exc}") from exc
+    db.execute("DELETE FROM documents WHERE id = %s", (document_id,))  # passages cascade
+    log.info("deleted %s and its passages", record["filename"])
+    return {"deleted": record["filename"]}
+
+
+@app.get("/api/documents/{document_id}/file")
+def document_file(document_id: int) -> FileResponse:
+    """The document itself, so a reference can open it at the cited page."""
+    record = db.query_one("SELECT * FROM documents WHERE id = %s", (document_id,))
+    if not record:
+        raise HTTPException(404, "no such document")
+    path = _document_path(record)
+    if not path.exists():
+        raise HTTPException(404, "the file is no longer in the knowledgebase folder")
+    media = "application/pdf" if path.suffix.lower() == ".pdf" else "text/plain; charset=utf-8"
+    return FileResponse(path, media_type=media, filename=path.name,
+                        content_disposition_type="inline")
+
+
 @app.post("/api/documents/{document_id}/exclude")
 def exclude_document(document_id: int) -> dict:
     """Drop a document from the index and stop reindexing it.
@@ -393,6 +448,47 @@ def start_indexing(tasks: BackgroundTasks, rebuild: bool = False) -> dict:
         return {"started": False, "reason": "indexing is already running"}
     tasks.add_task(ingest.index_pending, settings, rebuild)
     return {"started": True}
+
+
+# --------------------------------------------------------------------------- #
+# usage
+# --------------------------------------------------------------------------- #
+
+
+@app.get("/api/usage")
+def usage_report(days: int = 14) -> dict:
+    return store.usage_report(max(1, min(days, 90)))
+
+
+@app.get("/api/chats/{chat_id}/usage")
+def chat_usage(chat_id: int) -> dict:
+    if not store.get_chat(chat_id):
+        raise HTTPException(404, "no such chat")
+    return store.chat_usage(chat_id)
+
+
+def fold_memory(chat_id: int, current) -> None:
+    """Fold older messages into the chat's running summary, after the answer.
+
+    Runs once enough older messages have piled up, on the helper model, in the
+    background: the student never waits for it, and every later question in
+    the chat sends a short summary instead of the whole transcript.
+    """
+    try:
+        turns = store.messages_to_fold(chat_id)
+        if not turns:
+            return
+        chat = store.get_chat(chat_id) or {}
+        model = ChatModel(current, fast=bool(current.fast_model))
+        records: list[dict] = []
+        model.meter = records.append
+        summary = update_memory(model, chat.get("summary") or "", turns).strip()
+        if summary:
+            store.save_summary(chat_id, summary, turns[-1]["id"])
+        store.record_usage(records, chat_id=chat_id)
+        log.info("chat %s: folded %d messages into memory", chat_id, len(turns))
+    except Exception as exc:
+        log.warning("memory update failed for chat %s: %s", chat_id, exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -444,7 +540,8 @@ async def send_message(chat_id: int, body: Question) -> StreamingResponse:
         raise HTTPException(400, issues[0])
 
     question = body.content.strip()
-    history = store.history_for_model(chat_id)
+    # The last few messages verbatim, everything older as a running summary.
+    summary, history = store.conversation(chat_id)
     store.add_message(chat_id, "user", question)
     if chat["title"] == "New chat":
         store.rename_chat(chat_id, store.derive_title(question))
@@ -453,11 +550,20 @@ async def send_message(chat_id: int, body: Question) -> StreamingResponse:
         queue: asyncio.Queue = asyncio.Queue()
         loop = asyncio.get_running_loop()
 
+        current = settings
+        try:
+            pipeline = Pipeline(current)
+        except Exception as exc:  # e.g. a provider client that cannot be built
+            log.exception("could not start the pipeline")
+            yield _sse({"type": "error", "text": str(exc)})
+            return
+        completed = False
+
         def produce() -> None:
             # The pipeline is synchronous; run it off the event loop so streaming
             # to the browser is not blocked by provider calls.
             try:
-                for event in Pipeline(settings).answer(question, history):
+                for event in pipeline.answer(question, history, summary):
                     loop.call_soon_threadsafe(queue.put_nowait, event)
             except Exception as exc:
                 log.exception("pipeline failed")
@@ -478,13 +584,22 @@ async def send_message(chat_id: int, body: Question) -> StreamingResponse:
             if event["type"] == "citations":
                 citations = event["citations"]
             if event["type"] == "complete":
+                completed = True
                 result = event["result"]
-                saved = store.add_message(chat_id, "assistant", result.answer, citations)
-                yield _sse({"type": "done", "message_id": saved["id"]})
+                saved = store.add_message(chat_id, "assistant", result.answer, citations,
+                                          usage=result.usage)
+                store.record_usage(result.records, chat_id=chat_id, message_id=saved["id"])
+                yield _sse({"type": "done", "message_id": saved["id"], "usage": result.usage,
+                            "chat_usage": store.chat_usage(chat_id)})
+                threading.Thread(target=fold_memory, args=(chat_id, current),
+                                 daemon=True).start()
                 continue
             yield _sse(event)
 
         await task
+        if not completed:
+            # A failed answer still spent tokens on the steps that ran.
+            store.record_usage(list(pipeline.team.meter.records), chat_id=chat_id)
 
     return StreamingResponse(
         events(),

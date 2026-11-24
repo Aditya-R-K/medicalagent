@@ -57,6 +57,10 @@ EDITABLE = {
     "anthropic_fast_model": "ANTHROPIC_FAST_MODEL",
     "nvidia_fast_model": "NVIDIA_FAST_MODEL",
     "ollama_fast_model": "OLLAMA_FAST_MODEL",
+    # Study profile: who the student is, which exam, how long answers should be.
+    "learner_level": "LEARNER_LEVEL",
+    "exam_target": "EXAM_TARGET",
+    "answer_length": "ANSWER_LENGTH",
 }
 SECRETS = ("openai_api_key", "anthropic_api_key", "nvidia_api_key")
 # Written by the backend after it measures the embedding model, not by people.
@@ -129,6 +133,9 @@ class Settings:
     enable_review: bool
     enable_suggestions: bool
     fast_models: dict = field(default_factory=dict)
+    learner_level: str = ""   # preclinical | clinical | intern | pg | phd
+    exam_target: str = ""     # free text: USMLE Step 1, NEET-PG, PLAB, MRCP, thesis...
+    answer_length: str = ""   # concise | standard | detailed
 
     @property
     def truncating(self) -> bool:
@@ -233,6 +240,9 @@ def load(overrides: dict | None = None) -> Settings:
         chat_model=models.get(llm_provider, ""),
         fast_model=fast_models.get(llm_provider, ""),
         fast_models=fast_models,
+        learner_level=pick("learner_level"),
+        exam_target=pick("exam_target"),
+        answer_length=pick("answer_length"),
         embed_provider=embed_provider,
         embed_model=embed_model,
         embed_dim=embed_dim,

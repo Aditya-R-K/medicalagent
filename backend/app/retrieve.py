@@ -27,8 +27,14 @@ WORD = re.compile(r"[A-Za-z][A-Za-z0-9-]+|\d+[A-Za-z]*")
 
 CHUNK_COLUMNS = """
     c.id, c.document_id, c.text, c.parent_text, c.section, c.page_start, c.page_end,
-    d.filename, d.year
+    c.line_start, c.line_end, d.filename, d.year, d.title, d.author
 """
+
+
+def readable_title(filename: str) -> str:
+    """A book-like title from a file name, for PDFs that carry no title."""
+    stem = re.sub(r"\.(pdf|txt|md|markdown)$", "", filename.rsplit("/", 1)[-1], flags=re.I)
+    return re.sub(r"[_]+", " ", stem).strip()
 
 
 def any_words_query(text: str) -> str:
@@ -64,6 +70,10 @@ class Passage:
     score: float = 0.0
     signals: list[str] = None
     document_id: int = 0
+    line_start: int | None = None   # first line on page_start
+    line_end: int | None = None     # last line on page_end
+    title: str = ""
+    author: str = ""
 
     def __post_init__(self) -> None:
         self.signals = self.signals or []
@@ -77,19 +87,50 @@ class Passage:
         )
 
     @property
+    def location(self) -> str:
+        """Page and line: "p. 412, lines 14-31" or "pp. 411-412 (l. 30 to l. 12)"."""
+        if not (self.line_start and self.line_end):
+            return self.pages.replace("p.", "p. ").replace("pp. ", "pp. ")
+        if self.page_start == self.page_end:
+            lines = (f"line {self.line_start}" if self.line_start == self.line_end
+                     else f"lines {self.line_start}-{self.line_end}")
+            return f"p. {self.page_start}, {lines}"
+        return (f"pp. {self.page_start}-{self.page_end} "
+                f"(p. {self.page_start} l. {self.line_start} to p. {self.page_end} l. {self.line_end})")
+
+    @property
+    def book(self) -> str:
+        return self.title or readable_title(self.filename)
+
+    @property
     def citation(self) -> str:
         year = f", {self.year}" if self.year else ""
-        return f"{self.filename}{year}, {self.pages}"
+        return f"{self.book}{year}, {self.location}"
+
+    def vancouver(self) -> str:
+        """A reference in Vancouver style, the convention in medical writing."""
+        author = f"{self.author}. " if self.author else ""
+        year = f" {self.year}" if self.year else ""
+        pages = (f"p. {self.page_start}" if self.page_start == self.page_end
+                 else f"p. {self.page_start}-{self.page_end}")
+        return f"{author}{self.book}.{year}. {pages}."
 
     def to_dict(self, index: int) -> dict:
         return {
             "index": index,
             "source": self.filename,
+            "document_id": self.document_id,
+            "title": self.book,
+            "author": self.author,
             "year": self.year,
             "page_start": self.page_start,
             "page_end": self.page_end,
+            "line_start": self.line_start,
+            "line_end": self.line_end,
+            "location": self.location,
             "section": self.section,
             "citation": self.citation,
+            "vancouver": self.vancouver(),
             "score": round(self.score, 4),
             "signals": self.signals,
             "excerpt": self.text[:2000],
@@ -232,22 +273,12 @@ class Retriever:
         )
 
         top = max(fused.values()) or 1.0
-        passages = [
-            Passage(
-                id=row["id"],
-                text=row["text"],
-                parent_text=row["parent_text"],
-                section=row["section"],
-                page_start=row["page_start"],
-                page_end=row["page_end"],
-                filename=row["filename"],
-                year=row["year"],
-                score=fused[row["id"]] / top,
-                signals=sorted(signals[row["id"]]),
-                document_id=row["document_id"],
-            )
-            for row in rows
-        ]
+        passages = []
+        for row in rows:
+            passage = self._passage(row)
+            passage.score = fused[row["id"]] / top
+            passage.signals = sorted(signals[row["id"]])
+            passages.append(passage)
         passages.sort(key=lambda p: p.score, reverse=True)
         return passages
 
@@ -281,6 +312,8 @@ class Retriever:
             section=row["section"], page_start=row["page_start"],
             page_end=row["page_end"], filename=row["filename"], year=row["year"],
             document_id=row["document_id"],
+            line_start=row.get("line_start"), line_end=row.get("line_end"),
+            title=row.get("title") or "", author=row.get("author") or "",
         )
 
     def fetch(self, ids: list[int]) -> list[Passage]:
